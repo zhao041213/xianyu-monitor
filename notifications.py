@@ -19,6 +19,12 @@ from urllib.request import Request, urlopen
 
 LOGGER = logging.getLogger("xianyu-notifications")
 CHANNEL_NAMES = {"wecom": "企业微信", "dingtalk": "钉钉"}
+XIANYU_MOBILE_ITEM_URL = "https://h5.m.goofish.com/item"
+XIANYU_ITEM_HOSTS = {"www.goofish.com", "h5.m.goofish.com"}
+XIANYU_ITEM_PATHS = {
+    "/item",
+    "/app/idleFish-F2e/fish-mini-pha/detail.html",
+}
 
 
 class WebhookDeliveryError(RuntimeError):
@@ -216,6 +222,24 @@ def _escape_markdown(value: str) -> str:
     return escaped
 
 
+def build_xianyu_app_entry_url(listing_url: str) -> str:
+    try:
+        parsed = urlsplit(listing_url)
+    except ValueError:
+        return listing_url
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in XIANYU_ITEM_HOSTS
+        or parsed.path not in XIANYU_ITEM_PATHS
+    ):
+        return listing_url
+
+    item_ids = parse_qs(parsed.query).get("id", [])
+    if len(item_ids) != 1 or not item_ids[0].isdigit():
+        return listing_url
+    return f"{XIANYU_MOBILE_ITEM_URL}?{urlencode({'id': item_ids[0]})}"
+
+
 def build_webhook_payload(
     channel: str,
     notification: ListingNotification | None = None,
@@ -244,12 +268,18 @@ def build_webhook_payload(
     threshold = f"¥{notification.max_price:g}"
     link = notification.url
     if channel == "wecom":
+        app_link = build_xianyu_app_entry_url(link)
+        links = (
+            f"[在闲鱼 App 中打开]({app_link}) · [网页备用]({link})"
+            if app_link != link
+            else f"[查看闲鱼商品]({link})"
+        )
         content = (
             "## 闲鱼新商品提醒\n"
             f"> 关键词：`{keyword}`\n"
             f"> 价格：<font color=\"warning\">{price}</font>（低于 {threshold}）\n"
             f"> 商品：{title}\n\n"
-            f"[查看闲鱼商品]({link})"
+            f"{links}"
         )
         return {"msgtype": "markdown", "markdown": {"content": content}}
     if channel == "dingtalk":

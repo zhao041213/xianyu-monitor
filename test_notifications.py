@@ -12,6 +12,7 @@ from notifications import (
     WebhookDeliveryError,
     build_dingtalk_url,
     build_webhook_payload,
+    build_xianyu_app_entry_url,
 )
 
 
@@ -166,15 +167,53 @@ class NotificationTests(unittest.TestCase):
             price=59,
             keyword="mardi短袖",
             max_price=60,
-            url="https://www.goofish.com/item?id=test",
+            url=(
+                "https://www.goofish.com/item?"
+                "id=1234567890123&categoryId=126910002"
+            ),
         )
 
         wecom = build_webhook_payload("wecom", notification)
         dingtalk = build_webhook_payload("dingtalk", notification)
 
         self.assertIn("¥59.00", wecom["markdown"]["content"])
-        self.assertIn("查看闲鱼商品", wecom["markdown"]["content"])
+        self.assertIn("在闲鱼 App 中打开", wecom["markdown"]["content"])
+        self.assertIn(
+            "https://h5.m.goofish.com/item?id=1234567890123",
+            wecom["markdown"]["content"],
+        )
+        self.assertIn("网页备用", wecom["markdown"]["content"])
         self.assertIn("Mardi", dingtalk["markdown"]["text"])
+        self.assertIn(notification.url, dingtalk["markdown"]["text"])
+        self.assertNotIn("h5.m.goofish.com", dingtalk["markdown"]["text"])
+
+    def test_xianyu_web_url_converts_to_safe_mobile_app_entry(self) -> None:
+        self.assertEqual(
+            build_xianyu_app_entry_url(
+                "https://www.goofish.com/item?"
+                "id=1234567890123&categoryId=126910002"
+            ),
+            "https://h5.m.goofish.com/item?id=1234567890123",
+        )
+        self.assertEqual(
+            build_xianyu_app_entry_url(
+                "https://h5.m.goofish.com/app/idleFish-F2e/"
+                "fish-mini-pha/detail.html?id=1234567890123&forceFlush=1"
+            ),
+            "https://h5.m.goofish.com/item?id=1234567890123",
+        )
+
+    def test_xianyu_app_entry_rejects_untrusted_or_invalid_urls(self) -> None:
+        urls = [
+            "https://www.goofish.com.example.test/item?id=1234567890123",
+            "https://www.goofish.com/search?id=1234567890123",
+            "https://www.goofish.com/item?id=not-a-number",
+            "https://example.com/item?id=1234567890123",
+        ]
+
+        for url in urls:
+            with self.subTest(url=url):
+                self.assertEqual(build_xianyu_app_entry_url(url), url)
 
     def test_test_send_uses_saved_webhook_without_exposing_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
