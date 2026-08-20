@@ -4,14 +4,16 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 import webbrowser
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,59 @@ from xianyu_monitor import (
 LOGGER = logging.getLogger("xianyu-dashboard")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "dashboard"
+LOG_FILE = BASE_DIR / "dashboard_debug.log"
+DASHBOARD_BUILD = "2026.08.20-diagnostics-1"
+
+
+def configure_logging(log_file: Path = LOG_FILE) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=1_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[console_handler, file_handler],
+        force=True,
+    )
+
+
+def redact_diagnostic(value: Any, limit: int = 500) -> str:
+    text = " ".join(str(value).split())
+    text = re.sub(
+        r"(?i)(key|access_token|sign|secret)=([^&\s]+)",
+        r"\1=[redacted]",
+        text,
+    )
+    return text[:limit]
+
+
+def is_browser_closed_error(exc: Exception) -> bool:
+    return "Target page, context or browser has been closed" in str(exc)
+
+
+def monitor_error_message(exc: Exception, *, during_scan: bool = False) -> str:
+    detail = str(exc)
+    if is_browser_closed_error(exc):
+        if during_scan:
+            return "监控浏览器已关闭，请在面板中重新启动监控"
+        return (
+            "浏览器启动失败：监控专用浏览器可能已在其他窗口运行。"
+            "请关闭由本程序打开的闲鱼浏览器，再重新启动监控"
+        )
+    if "Executable doesn't exist" in detail:
+        return "缺少监控浏览器，请重新运行 Playwright 浏览器安装命令"
+    first_line = next((line.strip() for line in detail.splitlines() if line.strip()), "")
+    return first_line or exc.__class__.__name__
 
 
 def utc_now() -> datetime:
@@ -59,6 +114,10 @@ class MonitorConfig:
         if not keyword or len(keyword) > 80:
             raise ValueError("关键词长度必须为 1 到 80 个字符")
 
+        popup_enabled = payload.get("popup_enabled", cls.popup_enabled)
+        if not isinstance(popup_enabled, bool):
+            raise ValueError("系统文字弹窗状态无效")
+
         try:
             max_price = float(payload.get("max_price", cls.max_price))
             interval = int(payload.get("interval", cls.interval))
@@ -74,7 +133,7 @@ class MonitorConfig:
             keyword=keyword,
             max_price=max_price,
             interval=interval,
-            popup_enabled=bool(payload.get("popup_enabled", True)),
+            popup_enabled=popup_enabled,
         )
 
 
@@ -92,7 +151,9 @@ class MonitorController:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._scan_now_event = threading.Event()
+        self._interval_changed_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._popup_notifier: PopupNotifier | None = None
         self._logs: deque[dict[str, str]] = deque(maxlen=120)
 
         self.running = False
@@ -124,6 +185,7 @@ class MonitorController:
             self.config = config
             self._stop_event.clear()
             self._scan_now_event.clear()
+            self._interval_changed_event.clear()
             self.running = True
             self.scanning = False
             self.status = "starting"
@@ -170,6 +232,30 @@ class MonitorController:
         self.state_store.clear_alerts(self.config.keyword)
         self._log("info", f"“{self.config.keyword}”的推送记录已清空")
 
+    def set_popup_enabled(self, payload: dict[str, Any]) -> None:
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("系统文字弹窗状态无效")
+        with self._lock:
+            self.config = replace(self.config, popup_enabled=enabled)
+            notifier = self._popup_notifier
+        if notifier is not None:
+            notifier.set_enabled(enabled)
+        self._log("info", f"系统文字弹窗已{'开启' if enabled else '关闭'}")
+
+    def set_interval(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            config_payload = asdict(self.config)
+            config_payload["interval"] = payload.get("interval")
+            self.config = MonitorConfig.from_payload(config_payload)
+            interval = self.config.interval
+            if self.running and not self.scanning:
+                self.next_scan_at = (
+                    utc_now() + timedelta(seconds=interval)
+                ).isoformat()
+            self._interval_changed_event.set()
+        self._log("info", f"刷新间隔已更新为 {interval} 秒")
+
     def save_notifications(self, payload: dict[str, Any]) -> None:
         self.notifications.save(payload)
         self._log("info", "通知设置已保存")
@@ -188,6 +274,13 @@ class MonitorController:
             config = asdict(self.config)
             known_count = len(self.state_store.known_ids(self.config.keyword))
             return {
+                "build": DASHBOARD_BUILD,
+                "capabilities": {
+                    "live_interval": True,
+                    "live_popup": True,
+                    "file_logging": True,
+                },
+                "diagnostics": {"log_file": str(LOG_FILE)},
                 "running": self.running,
                 "scanning": self.scanning,
                 "status": self.status,
@@ -212,13 +305,15 @@ class MonitorController:
             asyncio.run(self._monitor_loop(self.config))
         except Exception as exc:
             LOGGER.exception("监控线程异常退出")
+            message = monitor_error_message(exc)
             with self._lock:
-                self.error = str(exc)
+                self.error = f"{message}。详细信息见 {LOG_FILE.name}"
                 self.status = "error"
                 self.status_text = "监控启动失败"
-            self._log("error", str(exc))
+            self._log("error", message)
         finally:
             with self._lock:
+                self._popup_notifier = None
                 self.running = False
                 self.scanning = False
                 self.next_scan_at = None
@@ -232,7 +327,10 @@ class MonitorController:
         except ImportError as exc:
             raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
 
-        notifier = PopupNotifier(enabled=config.popup_enabled)
+        notifier = PopupNotifier(enabled=False)
+        with self._lock:
+            self._popup_notifier = notifier
+            notifier.set_enabled(self.config.popup_enabled)
         async with async_playwright() as playwright:
             context = await playwright.chromium.launch_persistent_context(
                 user_data_dir=str(self.profile_dir),
@@ -267,11 +365,8 @@ class MonitorController:
                     except MonitoringSafetyStop as exc:
                         self._stop_for_safety(str(exc), notifier)
                     except Exception as exc:
-                        with self._lock:
-                            self.error = str(exc)
-                            self.status = "error"
-                            self.status_text = "本轮扫描失败"
-                        self._log("error", str(exc))
+                        LOGGER.exception("本轮扫描失败")
+                        self._handle_scan_error(exc)
                     finally:
                         with self._lock:
                             self.scanning = False
@@ -283,7 +378,7 @@ class MonitorController:
                                 self.next_scan_at = None
                             else:
                                 self.next_scan_at = (
-                                    utc_now() + timedelta(seconds=config.interval)
+                                    utc_now() + timedelta(seconds=self.config.interval)
                                 ).isoformat()
 
                     if self._stop_event.is_set():
@@ -348,6 +443,14 @@ class MonitorController:
     async def _wait_for_next_scan(self, interval: int) -> None:
         deadline = time.monotonic() + interval
         while not self._stop_event.is_set():
+            if self._interval_changed_event.is_set():
+                self._interval_changed_event.clear()
+                with self._lock:
+                    interval = self.config.interval
+                    self.next_scan_at = (
+                        utc_now() + timedelta(seconds=interval)
+                    ).isoformat()
+                deadline = time.monotonic() + interval
             if self._scan_now_event.is_set() or time.monotonic() >= deadline:
                 return
             await asyncio.sleep(0.25)
@@ -361,6 +464,17 @@ class MonitorController:
             self.next_scan_at = None
         self._log("error", reason)
         notifier.notify("闲鱼监控已自动停止", reason)
+
+    def _handle_scan_error(self, exc: Exception) -> None:
+        browser_closed = is_browser_closed_error(exc)
+        message = monitor_error_message(exc, during_scan=True)
+        with self._lock:
+            self.error = f"{message}。详细信息见 {LOG_FILE.name}"
+            self.status = "error"
+            self.status_text = "监控浏览器已关闭" if browser_closed else "本轮扫描失败"
+            if browser_closed:
+                self._stop_event.set()
+        self._log("error", message)
 
     def _log(self, level: str, message: str) -> None:
         entry = {"time": iso_now(), "level": level, "message": message}
@@ -397,6 +511,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         try:
+            LOGGER.info("API POST %s", self.path)
             payload = self._read_json()
             if self.path == "/api/start":
                 if not self.controller.start(payload):
@@ -418,6 +533,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.controller.clear_alerts()
                 self._send_json(self.controller.snapshot())
                 return
+            if self.path == "/api/popup":
+                self.controller.set_popup_enabled(payload)
+                self._send_json(self.controller.snapshot())
+                return
+            if self.path == "/api/interval":
+                self.controller.set_interval(payload)
+                self._send_json(self.controller.snapshot())
+                return
+            if self.path == "/api/client-log":
+                self._record_client_log(payload)
+                self._send_json({"ok": True})
+                return
             if self.path == "/api/notifications/save":
                 self.controller.save_notifications(payload)
                 self._send_json(self.controller.snapshot())
@@ -432,25 +559,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.controller.clear_notification(payload)
                 self._send_json(self.controller.snapshot())
                 return
+            LOGGER.warning("未知 API 路径: POST %s", self.path)
             self.send_error(HTTPStatus.NOT_FOUND)
         except ValueError as exc:
+            LOGGER.warning("API 参数错误 path=%s error=%s", self.path, redact_diagnostic(exc))
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except WebhookDeliveryError as exc:
+            LOGGER.warning("通知 API 失败 path=%s error=%s", self.path, redact_diagnostic(exc))
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         except Exception as exc:
-            LOGGER.exception("API 请求处理失败")
+            LOGGER.exception("API 请求处理失败 path=%s", self.path)
             self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("请求长度无效") from exc
+        if length < 0:
+            raise ValueError("请求长度无效")
         if length > 16_384:
             raise ValueError("请求内容过大")
         if not length:
             return {}
-        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("请求格式无效，必须是 UTF-8 JSON") from exc
         if not isinstance(payload, dict):
             raise ValueError("请求格式无效")
         return payload
+
+    def _record_client_log(self, payload: dict[str, Any]) -> None:
+        message = redact_diagnostic(payload.get("message", ""))
+        if not message:
+            raise ValueError("界面日志内容为空")
+        action = redact_diagnostic(payload.get("action", "unknown"), 80)
+        path = redact_diagnostic(payload.get("path", "unknown"), 120)
+        status = redact_diagnostic(payload.get("status", "-"), 20)
+        LOGGER.warning(
+            "界面操作失败 action=%s path=%s status=%s message=%s",
+            action,
+            path,
+            status,
+            message,
+        )
 
     def _send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -484,12 +637,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    configure_logging()
     args = build_parser().parse_args()
+    LOGGER.info("面板版本 %s，诊断日志 %s", DASHBOARD_BUILD, LOG_FILE)
     controller = MonitorController(
         state_path=BASE_DIR / "monitor_state.json",
         profile_dir=BASE_DIR / ".browser-data",

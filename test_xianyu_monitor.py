@@ -1,8 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from xianyu_monitor import (
+    PopupNotifier,
     SearchItem,
     StateStore,
     detect_blocking_issue,
@@ -18,6 +20,24 @@ from xianyu_monitor import (
 
 
 class XianyuParsingTests(unittest.TestCase):
+    def test_popup_notifier_can_be_enabled_after_startup(self) -> None:
+        with patch("xianyu_monitor.threading.Thread") as thread_class:
+            notifier = PopupNotifier(enabled=False)
+            notifier.notify("忽略", "关闭状态")
+            self.assertEqual(notifier._queue.qsize(), 0)
+
+            notifier.set_enabled(True)
+            notifier.notify("提醒", "开启状态")
+            self.assertEqual(notifier._queue.qsize(), 1)
+            thread_class.assert_called_once()
+            thread_class.return_value.start.assert_called_once()
+
+            notifier.set_enabled(False)
+            notifier.notify("忽略", "再次关闭")
+            notifier.set_enabled(True)
+            self.assertEqual(notifier._queue.qsize(), 1)
+            thread_class.assert_called_once()
+
     def test_parse_prices_shown_in_separate_dom_nodes(self) -> None:
         self.assertEqual(parse_price("商品标题\n¥\n5\n.90\n¥19.80"), 5.90)
         self.assertEqual(parse_price("商品标题 ¥ 1.2 万"), 12000)

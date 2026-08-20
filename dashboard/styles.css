@@ -403,6 +403,7 @@ input:focus, select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rg
   background: #fff0ed;
   color: #8b2f24;
   font-size: 13px;
+  white-space: pre-line;
 }
 
 .feed-grid {

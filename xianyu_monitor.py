@@ -324,10 +324,21 @@ class StateStore:
 
 class PopupNotifier:
     def __init__(self, enabled: bool = True) -> None:
-        self.enabled = enabled
+        self.enabled = False
         self._queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._lock = threading.Lock()
+        self._worker_started = False
         self._logged_unavailable = False
-        if enabled:
+        self.set_enabled(enabled)
+
+    def set_enabled(self, enabled: bool) -> None:
+        start_worker = False
+        with self._lock:
+            self.enabled = enabled
+            if enabled and not self._worker_started:
+                self._worker_started = True
+                start_worker = True
+        if start_worker:
             threading.Thread(
                 target=self._worker,
                 name="xianyu-popup-notifier",
@@ -335,7 +346,9 @@ class PopupNotifier:
             ).start()
 
     def notify(self, title: str, message: str) -> None:
-        if not self.enabled:
+        with self._lock:
+            enabled = self.enabled
+        if not enabled:
             return
         self._queue.put((title, message))
 
@@ -343,6 +356,10 @@ class PopupNotifier:
         while True:
             title, message = self._queue.get()
             try:
+                with self._lock:
+                    enabled = self.enabled
+                if not enabled:
+                    continue
                 if not self._show_message_box(title, message):
                     if not self._logged_unavailable:
                         LOGGER.warning("文字弹窗不可用，将保留控制台提示。")

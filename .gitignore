@@ -7,3 +7,4 @@ monitor_state.json
 monitor_state.json.tmp
 notification_config.json
 notification_config.json.tmp
+dashboard_debug.log*

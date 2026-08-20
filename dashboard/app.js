@@ -1,5 +1,10 @@
 const state = {
   initialized: false,
+  formDirty: false,
+  intervalUpdating: false,
+  popupUpdating: false,
+  clientError: null,
+  connectionError: null,
   alertIds: new Set(),
   currentKeyword: null,
   lastSnapshot: null,
@@ -55,14 +60,93 @@ const elements = {
   toast: document.querySelector("#toast"),
 };
 
+const OUTDATED_SERVICE_MESSAGE = "控制服务仍是旧版本，请关闭当前启动窗口后重新运行 start_dashboard.cmd";
+const LIVE_CONTROL_PATHS = new Set(["/api/interval", "/api/popup"]);
+
+function requestError(message, path, status = null) {
+  const error = new Error(message);
+  error.path = path;
+  error.status = status;
+  return error;
+}
+
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-  });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || `请求失败 (${response.status})`);
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    });
+  } catch (error) {
+    throw requestError(`无法连接控制服务：${error.message}`, path);
+  }
+
+  const responseText = await response.text();
+  let payload = {};
+  if (responseText) {
+    try {
+      payload = JSON.parse(responseText);
+    } catch (error) {
+      const message = LIVE_CONTROL_PATHS.has(path) && response.status === 404
+        ? OUTDATED_SERVICE_MESSAGE
+        : `控制服务返回了无法识别的内容 (${response.status})`;
+      throw requestError(message, path, response.status);
+    }
+  }
+  if (!response.ok) {
+    throw requestError(payload.error || `请求失败 (${response.status})`, path, response.status);
+  }
   return payload;
+}
+
+function hasLiveControlCapabilities(snapshot) {
+  return Boolean(
+    snapshot?.capabilities?.live_interval
+    && snapshot?.capabilities?.live_popup
+    && snapshot?.capabilities?.file_logging,
+  );
+}
+
+function updateErrorBanner(snapshot = state.lastSnapshot) {
+  const compatibilityError = snapshot && !hasLiveControlCapabilities(snapshot)
+    ? OUTDATED_SERVICE_MESSAGE
+    : null;
+  const messages = [
+    state.connectionError,
+    compatibilityError,
+    snapshot?.error,
+    state.clientError,
+  ].filter(Boolean);
+  const uniqueMessages = [...new Set(messages)];
+  elements.errorBanner.hidden = uniqueMessages.length === 0;
+  if (!uniqueMessages.length) {
+    elements.errorBanner.textContent = "";
+    return;
+  }
+  const logFile = snapshot?.diagnostics?.log_file || "dashboard_debug.log（重启后台后生成）";
+  elements.errorBanner.textContent = `${uniqueMessages.join("\n")}\n详细日志：${logFile}`;
+}
+
+function sendClientDiagnostic(action, error) {
+  void fetch("/api/client-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action,
+      message: error.message || String(error),
+      path: error.path || "unknown",
+      status: error.status ?? "-",
+    }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function reportClientError(action, error) {
+  state.clientError = `${action}失败：${error.message || String(error)}`;
+  console.error(`[闲鱼监控] ${state.clientError}`, error);
+  updateErrorBanner();
+  showToast(state.clientError);
+  sendClientDiagnostic(action, error);
 }
 
 function configFromForm() {
@@ -175,10 +259,11 @@ async function testNotification(channel) {
       method: "POST",
       body: JSON.stringify({ channel, ...payload }),
     });
+    state.clientError = null;
     render(response.snapshot);
     showToast(response.message);
   } catch (error) {
-    showToast(error.message);
+    reportClientError(`${channel === "wecom" ? "企业微信" : "钉钉"}通知测试`, error);
   } finally {
     button.disabled = false;
   }
@@ -192,6 +277,7 @@ async function clearNotification(channel) {
       method: "POST",
       body: JSON.stringify({ channel }),
     });
+    state.clientError = null;
     render(snapshot);
     elements[`${channel}Enabled`].checked = false;
     elements[`${channel}Webhook`].value = "";
@@ -202,14 +288,16 @@ async function clearNotification(channel) {
     }
     showToast(`${channelName}通知配置已移除`);
   } catch (error) {
-    showToast(error.message);
+    reportClientError(`移除${channelName}通知配置`, error);
   }
 }
 
 function render(snapshot) {
   state.lastSnapshot = snapshot;
+  state.connectionError = null;
   const running = snapshot.running;
   const scanning = snapshot.scanning;
+  const liveControlsAvailable = hasLiveControlCapabilities(snapshot);
   const keywordChanged = state.currentKeyword !== snapshot.config.keyword;
 
   elements.topStatus.textContent = snapshot.status_text;
@@ -220,13 +308,15 @@ function render(snapshot) {
   elements.scanButton.disabled = !running || scanning;
   elements.keyword.disabled = running;
   elements.maxPrice.disabled = running;
-  elements.interval.disabled = running;
-  elements.popupEnabled.disabled = running;
+  elements.interval.disabled = state.intervalUpdating || (running && !liveControlsAvailable);
+  elements.popupEnabled.disabled = state.popupUpdating || (running && !liveControlsAvailable);
 
-  if (!state.initialized || !running) {
+  if (!state.initialized || !state.formDirty) {
     elements.keyword.value = snapshot.config.keyword;
     elements.maxPrice.value = snapshot.config.max_price;
     elements.interval.value = String(snapshot.config.interval);
+  }
+  if (!state.popupUpdating) {
     elements.popupEnabled.checked = snapshot.config.popup_enabled;
   }
 
@@ -239,8 +329,7 @@ function render(snapshot) {
   elements.alertCount.textContent = `${snapshot.alerts.length} 条`;
   renderNotifications(snapshot.notifications);
 
-  elements.errorBanner.hidden = !snapshot.error;
-  elements.errorBanner.textContent = snapshot.error || "";
+  updateErrorBanner(snapshot);
 
   renderAlerts(snapshot.alerts);
   renderLogs(snapshot.logs);
@@ -311,44 +400,116 @@ async function refresh() {
   try {
     render(await api("/api/status"));
   } catch (error) {
+    const message = `控制服务未连接：${error.message || String(error)}`;
+    if (state.connectionError !== message) {
+      console.error(`[闲鱼监控] ${message}`, error);
+      sendClientDiagnostic("刷新状态", error);
+    }
+    state.connectionError = message;
     elements.topStatus.textContent = "控制服务未连接";
     elements.statusDot.className = "status-dot error";
+    updateErrorBanner();
   }
 }
 
 elements.form.addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    render(await api("/api/start", { method: "POST", body: JSON.stringify(configFromForm()) }));
+    const snapshot = await api("/api/start", {
+      method: "POST",
+      body: JSON.stringify(configFromForm()),
+    });
+    state.formDirty = false;
+    state.clientError = null;
+    render(snapshot);
     showToast("监控已启动");
   } catch (error) {
-    showToast(error.message);
+    reportClientError("启动监控", error);
+  }
+});
+
+[elements.keyword, elements.maxPrice, elements.interval].forEach((input) => {
+  input.addEventListener("input", () => {
+    state.formDirty = true;
+  });
+});
+
+elements.interval.addEventListener("change", async () => {
+  if (!state.lastSnapshot?.running) return;
+  const interval = Number(elements.interval.value);
+  const previous = state.lastSnapshot.config.interval;
+  state.intervalUpdating = true;
+  elements.interval.disabled = true;
+  try {
+    const snapshot = await api("/api/interval", {
+      method: "POST",
+      body: JSON.stringify({ interval }),
+    });
+    state.formDirty = false;
+    state.intervalUpdating = false;
+    state.clientError = null;
+    render(snapshot);
+    showToast(`刷新间隔已更新为 ${snapshot.config.interval} 秒`);
+  } catch (error) {
+    state.formDirty = false;
+    state.intervalUpdating = false;
+    elements.interval.value = String(previous);
+    elements.interval.disabled = false;
+    reportClientError("修改刷新间隔", error);
+  }
+});
+
+elements.popupEnabled.addEventListener("change", async () => {
+  const enabled = elements.popupEnabled.checked;
+  const previous = state.lastSnapshot?.config.popup_enabled ?? !enabled;
+  state.popupUpdating = true;
+  elements.popupEnabled.disabled = true;
+  try {
+    const snapshot = await api("/api/popup", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    state.popupUpdating = false;
+    state.clientError = null;
+    render(snapshot);
+    showToast(`系统文字弹窗已${enabled ? "开启" : "关闭"}`);
+  } catch (error) {
+    state.popupUpdating = false;
+    elements.popupEnabled.checked = previous;
+    elements.popupEnabled.disabled = false;
+    reportClientError("修改系统文字弹窗", error);
   }
 });
 
 elements.stopButton.addEventListener("click", async () => {
   try {
-    render(await api("/api/stop", { method: "POST", body: "{}" }));
+    const snapshot = await api("/api/stop", { method: "POST", body: "{}" });
+    state.clientError = null;
+    render(snapshot);
   } catch (error) {
-    showToast(error.message);
+    reportClientError("停止监控", error);
   }
 });
 
 elements.scanButton.addEventListener("click", async () => {
   try {
-    render(await api("/api/scan", { method: "POST", body: "{}" }));
+    const snapshot = await api("/api/scan", { method: "POST", body: "{}" });
+    state.clientError = null;
+    render(snapshot);
     showToast("已安排立即扫描");
   } catch (error) {
-    showToast(error.message);
+    reportClientError("立即扫描", error);
   }
 });
 
 elements.clearButton.addEventListener("click", async () => {
   try {
-    render(await api("/api/alerts/clear", { method: "POST", body: "{}" }));
+    const snapshot = await api("/api/alerts/clear", { method: "POST", body: "{}" });
+    state.clientError = null;
+    render(snapshot);
     showToast("推送记录已清空");
   } catch (error) {
-    showToast(error.message);
+    reportClientError("清空推送记录", error);
   }
 });
 
@@ -372,11 +533,12 @@ elements.notificationForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify(notificationPayloadFromForm()),
     });
+    state.clientError = null;
     render(snapshot);
     elements.notificationDialog.close();
     showToast("通知设置已保存");
   } catch (error) {
-    showToast(error.message);
+    reportClientError("保存通知设置", error);
   } finally {
     elements.notificationSaveButton.disabled = false;
   }
