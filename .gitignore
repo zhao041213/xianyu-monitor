@@ -1,0 +1,7 @@
+.browser-data/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+monitor_state.json
+monitor_state.json.tmp

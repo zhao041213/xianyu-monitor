@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f6f3">
+  <title>闲鱼新货雷达</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="闲鱼新货雷达首页">
+        <span class="brand-mark" aria-hidden="true">鱼</span>
+        <span>
+          <strong>闲鱼新货雷达</strong>
+          <small>NEW LISTING MONITOR</small>
+        </span>
+      </a>
+      <div class="topbar-status" aria-live="polite">
+        <span id="statusDot" class="status-dot"></span>
+        <span id="topStatus">读取状态中</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="control-rail" aria-label="监控设置">
+        <div class="rail-heading">
+          <span class="section-label">监控条件</span>
+          <span class="sort-lock">新发布 · 最新</span>
+        </div>
+
+        <form id="controlForm" class="control-form">
+          <label class="field">
+            <span>搜索关键词</span>
+            <input id="keyword" name="keyword" maxlength="80" value="mardi短袖" autocomplete="off">
+          </label>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>价格低于</span>
+              <span class="price-input"><b>¥</b><input id="maxPrice" name="max_price" type="number" min="0.01" step="0.01" value="60"></span>
+            </label>
+            <label class="field">
+              <span>刷新间隔</span>
+              <span class="unit-input"><input id="interval" name="interval" type="number" min="30" max="3600" step="1" value="60" inputmode="numeric"><b>秒</b></span>
+            </label>
+          </div>
+
+          <label class="toggle-row">
+            <strong>系统文字弹窗</strong>
+            <input id="popupEnabled" type="checkbox" checked>
+            <span class="toggle" aria-hidden="true"></span>
+          </label>
+
+          <div class="primary-actions">
+            <button id="startButton" class="button button-primary" type="submit"><span aria-hidden="true">▶</span>启动监控</button>
+            <button id="stopButton" class="button button-stop" type="button"><span aria-hidden="true">■</span>暂停</button>
+          </div>
+        </form>
+
+        <div class="rail-divider"></div>
+
+        <section class="scan-meta" aria-label="扫描状态">
+          <div>
+            <span>上次扫描</span>
+            <strong id="lastScan">--</strong>
+          </div>
+          <div>
+            <span>下次扫描</span>
+            <strong id="nextScan">--</strong>
+          </div>
+          <div>
+            <span>本轮商品</span>
+            <strong id="itemCount">0</strong>
+          </div>
+          <div>
+            <span>已见商品</span>
+            <strong id="knownCount">0</strong>
+          </div>
+        </section>
+
+        <button id="scanButton" class="button button-secondary" type="button"><span aria-hidden="true">↻</span>立即扫描</button>
+
+        <section class="activity" aria-labelledby="activityTitle">
+          <div class="activity-heading">
+            <span id="activityTitle" class="section-label">运行记录</span>
+          </div>
+          <ol id="activityList" class="activity-list"></ol>
+        </section>
+      </aside>
+
+      <section class="feed" aria-labelledby="feedTitle">
+        <div id="scanBand" class="scan-band"><span></span></div>
+        <div class="feed-header">
+          <div>
+            <span class="section-label">实时推送 · <b id="keywordTitle">mardi短袖</b></span>
+            <h1 id="feedTitle">低于 <span id="priceTitle">¥60</span> 的新商品</h1>
+          </div>
+          <div class="feed-actions">
+            <span id="alertCount" class="alert-count">0 条</span>
+            <button id="clearButton" class="icon-button" type="button" title="清空推送记录" aria-label="清空推送记录">×</button>
+          </div>
+        </div>
+
+        <div id="errorBanner" class="error-banner" role="alert" hidden></div>
+        <div id="feedGrid" class="feed-grid"></div>
+        <div id="emptyState" class="empty-state">
+          <div class="radar-glyph" aria-hidden="true"><span></span></div>
+          <strong>等待新商品</strong>
+          <span id="emptyStatus">尚未建立基线</span>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
