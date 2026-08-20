@@ -16,6 +16,8 @@ const elements = {
   keyword: document.querySelector("#keyword"),
   maxPrice: document.querySelector("#maxPrice"),
   interval: document.querySelector("#interval"),
+  intervalModes: [...document.querySelectorAll('input[name="interval_mode"]')],
+  accessModes: [...document.querySelectorAll('input[name="access_mode"]')],
   popupEnabled: document.querySelector("#popupEnabled"),
   notificationSettingsButton: document.querySelector("#notificationSettingsButton"),
   notificationDialog: document.querySelector("#notificationDialog"),
@@ -39,7 +41,9 @@ const elements = {
   dingtalkStatusText: document.querySelector("#dingtalkStatusText"),
   dingtalkDialogStatus: document.querySelector("#dingtalkDialogStatus"),
   startButton: document.querySelector("#startButton"),
+  startButtonLabel: document.querySelector("#startButtonLabel"),
   stopButton: document.querySelector("#stopButton"),
+  stopButtonLabel: document.querySelector("#stopButtonLabel"),
   scanButton: document.querySelector("#scanButton"),
   clearButton: document.querySelector("#clearButton"),
   topStatus: document.querySelector("#topStatus"),
@@ -102,6 +106,7 @@ async function api(path, options = {}) {
 function hasLiveControlCapabilities(snapshot) {
   return Boolean(
     snapshot?.capabilities?.live_interval
+    && snapshot?.capabilities?.interval_cycle
     && snapshot?.capabilities?.live_popup
     && snapshot?.capabilities?.file_logging,
   );
@@ -154,7 +159,9 @@ function configFromForm() {
     keyword: elements.keyword.value.trim(),
     max_price: Number(elements.maxPrice.value),
     interval: Number(elements.interval.value),
+    interval_cycle_enabled: elements.intervalModes.some((input) => input.checked && input.value === "cycle"),
     popup_enabled: elements.popupEnabled.checked,
+    access_mode: elements.accessModes.find((input) => input.checked)?.value || "login",
   };
 }
 
@@ -166,6 +173,12 @@ function formatClock(value) {
     second: "2-digit",
     hour12: false,
   }).format(new Date(value));
+}
+
+function formatInterval(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  return seconds % 60 === 0 ? `${seconds / 60}分` : `${seconds}秒`;
 }
 
 function formatFoundAt(value) {
@@ -297,6 +310,7 @@ function render(snapshot) {
   state.connectionError = null;
   const running = snapshot.running;
   const scanning = snapshot.scanning;
+  const verificationPaused = snapshot.status === "safety_stopped";
   const liveControlsAvailable = hasLiveControlCapabilities(snapshot);
   const keywordChanged = state.currentKeyword !== snapshot.config.keyword;
 
@@ -304,18 +318,33 @@ function render(snapshot) {
   elements.statusDot.className = `status-dot ${snapshot.error ? "error" : scanning ? "scanning" : running ? "running" : ""}`;
   elements.scanBand.classList.toggle("active", scanning);
   elements.startButton.disabled = running;
-  elements.stopButton.disabled = !running;
+  elements.startButtonLabel.textContent = verificationPaused ? "继续监控" : "启动监控";
+  elements.stopButton.disabled = !running && !verificationPaused;
+  elements.stopButtonLabel.textContent = verificationPaused ? "关闭浏览器" : "暂停";
   elements.scanButton.disabled = !running || scanning;
-  elements.keyword.disabled = running;
-  elements.maxPrice.disabled = running;
-  elements.interval.disabled = state.intervalUpdating || (running && !liveControlsAvailable);
+  elements.keyword.disabled = running || verificationPaused;
+  elements.maxPrice.disabled = running || verificationPaused;
+  elements.accessModes.forEach((input) => { input.disabled = running || verificationPaused; });
   elements.popupEnabled.disabled = state.popupUpdating || (running && !liveControlsAvailable);
 
   if (!state.initialized || !state.formDirty) {
     elements.keyword.value = snapshot.config.keyword;
     elements.maxPrice.value = snapshot.config.max_price;
     elements.interval.value = String(snapshot.config.interval);
+    const intervalMode = snapshot.config.interval_cycle_enabled ? "cycle" : "fixed";
+    elements.intervalModes.forEach((input) => { input.checked = input.value === intervalMode; });
+    const accessMode = snapshot.config.access_mode || "login";
+    elements.accessModes.forEach((input) => { input.checked = input.value === accessMode; });
   }
+  const intervalCycleEnabled = elements.intervalModes.some(
+    (input) => input.checked && input.value === "cycle",
+  );
+  elements.interval.disabled = state.intervalUpdating
+    || intervalCycleEnabled
+    || (running && !liveControlsAvailable);
+  elements.intervalModes.forEach((input) => {
+    input.disabled = state.intervalUpdating || (running && !liveControlsAvailable);
+  });
   if (!state.popupUpdating) {
     elements.popupEnabled.checked = snapshot.config.popup_enabled;
   }
@@ -323,7 +352,13 @@ function render(snapshot) {
   elements.priceTitle.textContent = `¥${Number(snapshot.config.max_price).toLocaleString("zh-CN")}`;
   elements.keywordTitle.textContent = snapshot.config.keyword;
   elements.lastScan.textContent = formatClock(snapshot.last_scan_at);
-  elements.nextScan.textContent = scanning ? "扫描中" : formatClock(snapshot.next_scan_at);
+  const scheduledInterval = formatInterval(snapshot.scheduled_interval_seconds);
+  const nextScanTime = formatClock(snapshot.next_scan_at);
+  elements.nextScan.textContent = scanning
+    ? "扫描中"
+    : scheduledInterval && nextScanTime !== "--"
+      ? `${nextScanTime} · ${scheduledInterval}`
+      : nextScanTime;
   elements.itemCount.textContent = snapshot.items_last_scan;
   elements.knownCount.textContent = snapshot.known_count;
   elements.alertCount.textContent = `${snapshot.alerts.length} 条`;
@@ -414,6 +449,7 @@ async function refresh() {
 
 elements.form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  const wasPaused = state.lastSnapshot?.status === "safety_stopped";
   try {
     const snapshot = await api("/api/start", {
       method: "POST",
@@ -422,41 +458,70 @@ elements.form.addEventListener("submit", async (event) => {
     state.formDirty = false;
     state.clientError = null;
     render(snapshot);
-    showToast("监控已启动");
+    showToast(wasPaused ? "监控已恢复" : "监控已启动");
   } catch (error) {
     reportClientError("启动监控", error);
   }
 });
 
-[elements.keyword, elements.maxPrice, elements.interval].forEach((input) => {
+[elements.keyword, elements.maxPrice, elements.interval, ...elements.intervalModes, ...elements.accessModes].forEach((input) => {
   input.addEventListener("input", () => {
     state.formDirty = true;
   });
 });
 
-elements.interval.addEventListener("change", async () => {
-  if (!state.lastSnapshot?.running) return;
+async function saveIntervalSettings() {
   const interval = Number(elements.interval.value);
-  const previous = state.lastSnapshot.config.interval;
+  const intervalCycleEnabled = elements.intervalModes.some(
+    (input) => input.checked && input.value === "cycle",
+  );
+  const previousInterval = state.lastSnapshot.config.interval;
+  const previousCycleEnabled = state.lastSnapshot.config.interval_cycle_enabled;
   state.intervalUpdating = true;
   elements.interval.disabled = true;
+  elements.intervalModes.forEach((input) => { input.disabled = true; });
   try {
     const snapshot = await api("/api/interval", {
       method: "POST",
-      body: JSON.stringify({ interval }),
+      body: JSON.stringify({
+        interval,
+        interval_cycle_enabled: intervalCycleEnabled,
+      }),
     });
     state.formDirty = false;
     state.intervalUpdating = false;
     state.clientError = null;
     render(snapshot);
-    showToast(`刷新间隔已更新为 ${snapshot.config.interval} 秒`);
+    showToast(snapshot.config.interval_cycle_enabled
+      ? "已启用 1-5 分钟循环刷新"
+      : `刷新间隔已更新为 ${snapshot.config.interval} 秒`);
   } catch (error) {
     state.formDirty = false;
     state.intervalUpdating = false;
-    elements.interval.value = String(previous);
-    elements.interval.disabled = false;
+    elements.interval.value = String(previousInterval);
+    const previousMode = previousCycleEnabled ? "cycle" : "fixed";
+    elements.intervalModes.forEach((input) => { input.checked = input.value === previousMode; });
+    elements.interval.disabled = previousCycleEnabled;
+    elements.intervalModes.forEach((input) => { input.disabled = false; });
     reportClientError("修改刷新间隔", error);
   }
+}
+
+elements.interval.addEventListener("change", async () => {
+  if (!state.lastSnapshot?.running) return;
+  await saveIntervalSettings();
+});
+
+elements.intervalModes.forEach((input) => {
+  input.addEventListener("change", async () => {
+    if (!input.checked) return;
+    state.formDirty = true;
+    if (!state.lastSnapshot?.running) {
+      elements.interval.disabled = input.value === "cycle";
+      return;
+    }
+    await saveIntervalSettings();
+  });
 });
 
 elements.popupEnabled.addEventListener("change", async () => {

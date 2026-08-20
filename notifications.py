@@ -25,6 +25,7 @@ XIANYU_ITEM_PATHS = {
     "/item",
     "/app/idleFish-F2e/fish-mini-pha/detail.html",
 }
+TRUSTED_IMAGE_HOST_SUFFIX = ".alicdn.com"
 
 
 class WebhookDeliveryError(RuntimeError):
@@ -51,6 +52,7 @@ class ListingNotification:
     keyword: str
     max_price: float
     url: str
+    image_url: str | None = None
 
 
 def iso_now() -> str:
@@ -240,6 +242,28 @@ def build_xianyu_app_entry_url(listing_url: str) -> str:
     return f"{XIANYU_MOBILE_ITEM_URL}?{urlencode({'id': item_ids[0]})}"
 
 
+def normalize_listing_image_url(image_url: str | None) -> str | None:
+    if not image_url:
+        return None
+    candidate = image_url.strip()
+    if candidate.startswith("//"):
+        candidate = f"https:{candidate}"
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return None
+    hostname = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or parsed.port not in {None, 443}
+        or not hostname.endswith(TRUSTED_IMAGE_HOST_SUFFIX)
+    ):
+        return None
+    return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
+
+
 def build_webhook_payload(
     channel: str,
     notification: ListingNotification | None = None,
@@ -267,8 +291,32 @@ def build_webhook_payload(
     price = f"¥{notification.price:.2f}"
     threshold = f"¥{notification.max_price:g}"
     link = notification.url
+    image_url = normalize_listing_image_url(notification.image_url)
     if channel == "wecom":
         app_link = build_xianyu_app_entry_url(link)
+        if image_url:
+            plain_title = " ".join(notification.title.split())
+            description = (
+                f"关键词：{notification.keyword} | 价格：{price}（低于 {threshold}）"
+            )
+            articles = [
+                {
+                    "title": f"{price} {plain_title}"[:128],
+                    "description": description[:512],
+                    "url": app_link,
+                    "picurl": image_url,
+                }
+            ]
+            if app_link != link:
+                articles.append(
+                    {
+                        "title": "网页备用：在浏览器打开商品",
+                        "description": plain_title[:512],
+                        "url": link,
+                        "picurl": image_url,
+                    }
+                )
+            return {"msgtype": "news", "news": {"articles": articles}}
         links = (
             f"[在闲鱼 App 中打开]({app_link}) · [网页备用]({link})"
             if app_link != link
@@ -283,8 +331,10 @@ def build_webhook_payload(
         )
         return {"msgtype": "markdown", "markdown": {"content": content}}
     if channel == "dingtalk":
+        image = f"![商品图片]({image_url})\n\n" if image_url else ""
         text = (
             "### 闲鱼新商品提醒\n\n"
+            f"{image}"
             f"- 关键词：{keyword}\n"
             f"- 价格：**{price}**（低于 {threshold}）\n"
             f"- 商品：{title}\n\n"

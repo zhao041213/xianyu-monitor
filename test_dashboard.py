@@ -4,6 +4,7 @@ from pathlib import Path
 
 from dashboard import (
     DASHBOARD_BUILD,
+    INTERVAL_CYCLE_SECONDS,
     MonitorConfig,
     MonitorController,
     is_browser_closed_error,
@@ -45,6 +46,8 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(config.keyword, "mardi短袖")
         self.assertEqual(config.max_price, 60)
         self.assertEqual(config.interval, 60)
+        self.assertTrue(config.interval_cycle_enabled)
+        self.assertEqual(config.access_mode, "login")
 
     def test_config_rejects_too_frequent_scanning(self) -> None:
         with self.assertRaises(ValueError):
@@ -52,17 +55,51 @@ class DashboardTests(unittest.TestCase):
 
     def test_keyword_and_price_limit_are_configurable(self) -> None:
         config = MonitorConfig.from_payload(
-            {"keyword": "iPhone 15", "max_price": 3200, "interval": 120}
+            {
+                "keyword": "iPhone 15",
+                "max_price": 3200,
+                "interval": 120,
+                "interval_cycle_enabled": False,
+                "access_mode": "guest",
+            }
         )
         self.assertEqual(config.keyword, "iPhone 15")
         self.assertEqual(config.max_price, 3200)
         self.assertEqual(config.interval, 120)
+        self.assertFalse(config.interval_cycle_enabled)
+        self.assertEqual(config.access_mode, "guest")
+
+    def test_config_rejects_unknown_access_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "访问方式"):
+            MonitorConfig.from_payload({"access_mode": "stealth"})
 
     def test_refresh_interval_accepts_custom_seconds(self) -> None:
-        self.assertEqual(
-            MonitorConfig.from_payload({"interval": 450}).interval,
-            450,
+        config = MonitorConfig.from_payload(
+            {"interval": 450, "interval_cycle_enabled": False}
         )
+        self.assertEqual(config.interval, 450)
+        self.assertFalse(config.interval_cycle_enabled)
+
+    def test_config_rejects_invalid_interval_cycle_state(self) -> None:
+        with self.assertRaisesRegex(ValueError, "循环刷新状态"):
+            MonitorConfig.from_payload({"interval_cycle_enabled": "true"})
+
+    def test_interval_cycle_repeats_from_one_to_five_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+
+            with controller._lock:
+                intervals = [
+                    controller._take_next_interval_locked()
+                    for _ in range(len(INTERVAL_CYCLE_SECONDS) + 2)
+                ]
+
+            self.assertEqual(intervals, [60, 120, 180, 240, 300, 60, 120])
 
     def test_snapshot_exposes_live_controls_and_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -77,6 +114,7 @@ class DashboardTests(unittest.TestCase):
 
             self.assertEqual(snapshot["build"], DASHBOARD_BUILD)
             self.assertTrue(snapshot["capabilities"]["live_interval"])
+            self.assertTrue(snapshot["capabilities"]["interval_cycle"])
             self.assertTrue(snapshot["capabilities"]["live_popup"])
             self.assertTrue(snapshot["capabilities"]["file_logging"])
             self.assertTrue(snapshot["diagnostics"]["log_file"].endswith("dashboard_debug.log"))
@@ -90,6 +128,14 @@ class DashboardTests(unittest.TestCase):
         message = monitor_error_message(error)
 
         self.assertIn("监控专用浏览器可能已在其他窗口运行", message)
+
+    def test_missing_edge_has_readable_error(self) -> None:
+        error = RuntimeError("BrowserType.launch: Executable doesn't exist")
+
+        self.assertEqual(
+            monitor_error_message(error),
+            "未找到 Microsoft Edge，请先安装或修复 Microsoft Edge",
+        )
 
     def test_closed_monitor_browser_is_fatal_during_scan(self) -> None:
         error = RuntimeError("Page.goto: Target page, context or browser has been closed")
@@ -133,9 +179,13 @@ class DashboardTests(unittest.TestCase):
             )
             controller.running = True
 
-            controller.set_interval({"interval": 137})
+            controller.set_interval(
+                {"interval": 137, "interval_cycle_enabled": False}
+            )
 
             self.assertEqual(controller.config.interval, 137)
+            self.assertFalse(controller.config.interval_cycle_enabled)
+            self.assertEqual(controller.scheduled_interval_seconds, 137)
             self.assertTrue(controller._interval_changed_event.is_set())
             self.assertIsNotNone(controller.next_scan_at)
 
@@ -170,19 +220,64 @@ class DashboardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "系统文字弹窗状态无效"):
                 MonitorConfig.from_payload({"popup_enabled": "false"})
 
-    def test_safety_issue_stops_monitor_and_notifies(self) -> None:
+    def test_safety_issue_pauses_monitor_and_keeps_browser_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             controller = MonitorController(root / "state.json", root / "profile")
             notifier = FakeNotifier()
+            controller.running = True
 
-            controller._stop_for_safety("检测到访问受限", notifier)
+            controller._pause_for_safety("检测到访问受限", notifier)
 
-            self.assertTrue(controller._stop_event.is_set())
+            self.assertFalse(controller._stop_event.is_set())
+            self.assertFalse(controller.running)
             self.assertEqual(controller.status, "safety_stopped")
-            self.assertEqual(controller.status_text, "已自动停止")
+            self.assertEqual(controller.status_text, "等待人工验证")
             self.assertEqual(controller.error, "检测到访问受限")
             self.assertEqual(len(notifier.messages), 1)
+
+    def test_safety_pause_resumes_existing_monitor_thread(self) -> None:
+        class AliveThread:
+            @staticmethod
+            def is_alive() -> bool:
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+            controller._thread = AliveThread()
+            controller.status = "safety_stopped"
+            controller.running = False
+
+            started = controller.start({"access_mode": "login"})
+
+            self.assertTrue(started)
+            self.assertTrue(controller.running)
+            self.assertEqual(controller.status, "resuming")
+            self.assertTrue(controller._resume_event.is_set())
+            self.assertFalse(controller._stop_event.is_set())
+
+    def test_safety_pause_can_be_stopped_and_close_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+            controller.status = "safety_stopped"
+            controller.running = False
+
+            stopped = controller.stop()
+
+            self.assertTrue(stopped)
+            self.assertTrue(controller._stop_event.is_set())
+            self.assertTrue(controller._resume_event.is_set())
+            self.assertEqual(controller.status, "stopping")
 
     def test_first_scan_is_silent_then_only_new_low_price_item_alerts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

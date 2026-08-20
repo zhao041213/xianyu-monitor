@@ -39,7 +39,10 @@ LOGGER = logging.getLogger("xianyu-dashboard")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "dashboard"
 LOG_FILE = BASE_DIR / "dashboard_debug.log"
-DASHBOARD_BUILD = "2026.08.20-diagnostics-1"
+DASHBOARD_BUILD = "2026.08.21-edge-cycle-1"
+MONITOR_BROWSER_CHANNEL = "msedge"
+INTERVAL_CYCLE_SECONDS = (60, 120, 180, 240, 300)
+ACCESS_MODES = {"login", "guest"}
 
 
 def configure_logging(log_file: Path = LOG_FILE) -> None:
@@ -88,7 +91,7 @@ def monitor_error_message(exc: Exception, *, during_scan: bool = False) -> str:
             "请关闭由本程序打开的闲鱼浏览器，再重新启动监控"
         )
     if "Executable doesn't exist" in detail:
-        return "缺少监控浏览器，请重新运行 Playwright 浏览器安装命令"
+        return "未找到 Microsoft Edge，请先安装或修复 Microsoft Edge"
     first_line = next((line.strip() for line in detail.splitlines() if line.strip()), "")
     return first_line or exc.__class__.__name__
 
@@ -106,7 +109,9 @@ class MonitorConfig:
     keyword: str = "mardi短袖"
     max_price: float = 60.0
     interval: int = 60
+    interval_cycle_enabled: bool = True
     popup_enabled: bool = True
+    access_mode: str = "login"
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "MonitorConfig":
@@ -117,6 +122,17 @@ class MonitorConfig:
         popup_enabled = payload.get("popup_enabled", cls.popup_enabled)
         if not isinstance(popup_enabled, bool):
             raise ValueError("系统文字弹窗状态无效")
+
+        interval_cycle_enabled = payload.get(
+            "interval_cycle_enabled",
+            cls.interval_cycle_enabled,
+        )
+        if not isinstance(interval_cycle_enabled, bool):
+            raise ValueError("循环刷新状态无效")
+
+        access_mode = str(payload.get("access_mode", cls.access_mode)).strip().casefold()
+        if access_mode not in ACCESS_MODES:
+            raise ValueError("访问方式必须是登录模式或游客模式")
 
         try:
             max_price = float(payload.get("max_price", cls.max_price))
@@ -133,7 +149,9 @@ class MonitorConfig:
             keyword=keyword,
             max_price=max_price,
             interval=interval,
+            interval_cycle_enabled=interval_cycle_enabled,
             popup_enabled=popup_enabled,
+            access_mode=access_mode,
         )
 
 
@@ -150,8 +168,11 @@ class MonitorController:
         self.config = MonitorConfig()
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._resume_event = threading.Event()
         self._scan_now_event = threading.Event()
         self._interval_changed_event = threading.Event()
+        self._interval_cycle_index = 0
+        self.scheduled_interval_seconds: int | None = None
         self._thread: threading.Thread | None = None
         self._popup_notifier: PopupNotifier | None = None
         self._logs: deque[dict[str, str]] = deque(maxlen=120)
@@ -177,44 +198,79 @@ class MonitorController:
         config = MonitorConfig.from_payload(payload or {})
         with self._lock:
             if self._thread and self._thread.is_alive():
-                return False
-            keyword_changed = (
-                self.state_store.watch_key(self.config.keyword)
-                != self.state_store.watch_key(config.keyword)
-            )
-            self.config = config
-            self._stop_event.clear()
-            self._scan_now_event.clear()
-            self._interval_changed_event.clear()
-            self.running = True
-            self.scanning = False
-            self.status = "starting"
-            self.status_text = "正在启动浏览器"
-            self.error = None
-            self.baseline_ready = self.state_store.has_baseline(config.keyword)
-            self.next_scan_at = None
-            if keyword_changed:
-                self.last_scan_at = None
-                self.scans_completed = 0
-                self.items_last_scan = 0
-                self.new_items_last_scan = 0
-                self.matched_last_scan = 0
-            self._thread = threading.Thread(
-                target=self._thread_main,
-                name="xianyu-monitor-worker",
-                daemon=True,
-            )
-            self._thread.start()
-        self._log("info", f"监控已启动：{config.keyword}，价格低于 {config.max_price:g} 元")
+                if self.status != "safety_stopped":
+                    return False
+                keyword_changed = (
+                    self.state_store.watch_key(self.config.keyword)
+                    != self.state_store.watch_key(config.keyword)
+                )
+                if keyword_changed or config.access_mode != self.config.access_mode:
+                    raise ValueError("等待人工验证时不能修改关键词或访问方式，请先停止监控")
+                self.config = config
+                self._interval_cycle_index = 0
+                self.scheduled_interval_seconds = None
+                self.running = True
+                self.scanning = False
+                self.status = "resuming"
+                self.status_text = "正在恢复监控"
+                self.error = None
+                self.next_scan_at = None
+                self._resume_event.set()
+                resumed = True
+            else:
+                resumed = False
+                keyword_changed = (
+                    self.state_store.watch_key(self.config.keyword)
+                    != self.state_store.watch_key(config.keyword)
+                )
+                self.config = config
+                self._stop_event.clear()
+                self._resume_event.clear()
+                self._scan_now_event.clear()
+                self._interval_changed_event.clear()
+                self._interval_cycle_index = 0
+                self.scheduled_interval_seconds = None
+                self.running = True
+                self.scanning = False
+                self.status = "starting"
+                self.status_text = "正在启动浏览器"
+                self.error = None
+                self.baseline_ready = self.state_store.has_baseline(config.keyword)
+                self.next_scan_at = None
+                if keyword_changed:
+                    self.last_scan_at = None
+                    self.scans_completed = 0
+                    self.items_last_scan = 0
+                    self.new_items_last_scan = 0
+                    self.matched_last_scan = 0
+                self._thread = threading.Thread(
+                    target=self._thread_main,
+                    name="xianyu-monitor-worker",
+                    daemon=True,
+                )
+                self._thread.start()
+        action = "恢复" if resumed else "启动"
+        mode = "游客模式" if config.access_mode == "guest" else "登录模式"
+        interval_mode = (
+            "1 到 5 分钟循环刷新"
+            if config.interval_cycle_enabled
+            else f"每 {config.interval} 秒刷新"
+        )
+        self._log(
+            "info",
+            f"监控已{action}：{config.keyword}，价格低于 {config.max_price:g} 元，"
+            f"{mode}，{interval_mode}",
+        )
         return True
 
     def stop(self) -> bool:
         with self._lock:
-            if not self.running:
+            if not self.running and self.status != "safety_stopped":
                 return False
             self.status = "stopping"
             self.status_text = "正在停止"
             self._stop_event.set()
+            self._resume_event.set()
             self._scan_now_event.set()
         self._log("info", "正在停止监控")
         return True
@@ -246,15 +302,29 @@ class MonitorController:
     def set_interval(self, payload: dict[str, Any]) -> None:
         with self._lock:
             config_payload = asdict(self.config)
-            config_payload["interval"] = payload.get("interval")
+            if "interval" in payload:
+                config_payload["interval"] = payload["interval"]
+            if "interval_cycle_enabled" in payload:
+                config_payload["interval_cycle_enabled"] = payload[
+                    "interval_cycle_enabled"
+                ]
             self.config = MonitorConfig.from_payload(config_payload)
-            interval = self.config.interval
+            self._interval_cycle_index = 0
             if self.running and not self.scanning:
+                interval = self._take_next_interval_locked()
+                self.scheduled_interval_seconds = interval
                 self.next_scan_at = (
                     utc_now() + timedelta(seconds=interval)
                 ).isoformat()
+            else:
+                self.scheduled_interval_seconds = None
             self._interval_changed_event.set()
-        self._log("info", f"刷新间隔已更新为 {interval} 秒")
+        message = (
+            "刷新方式已更新为 1 到 5 分钟循环"
+            if self.config.interval_cycle_enabled
+            else f"刷新间隔已更新为 {self.config.interval} 秒"
+        )
+        self._log("info", message)
 
     def save_notifications(self, payload: dict[str, Any]) -> None:
         self.notifications.save(payload)
@@ -277,8 +347,11 @@ class MonitorController:
                 "build": DASHBOARD_BUILD,
                 "capabilities": {
                     "live_interval": True,
+                    "interval_cycle": True,
                     "live_popup": True,
                     "file_logging": True,
+                    "guest_mode": True,
+                    "verification_pause": True,
                 },
                 "diagnostics": {"log_file": str(LOG_FILE)},
                 "running": self.running,
@@ -289,6 +362,7 @@ class MonitorController:
                 "baseline_ready": self.baseline_ready,
                 "last_scan_at": self.last_scan_at,
                 "next_scan_at": self.next_scan_at,
+                "scheduled_interval_seconds": self.scheduled_interval_seconds,
                 "scans_completed": self.scans_completed,
                 "items_last_scan": self.items_last_scan,
                 "new_items_last_scan": self.new_items_last_scan,
@@ -317,6 +391,7 @@ class MonitorController:
                 self.running = False
                 self.scanning = False
                 self.next_scan_at = None
+                self.scheduled_interval_seconds = None
                 if self.status not in {"error", "safety_stopped"}:
                     self.status = "stopped"
                     self.status_text = "已停止"
@@ -332,12 +407,24 @@ class MonitorController:
             self._popup_notifier = notifier
             notifier.set_enabled(self.config.popup_enabled)
         async with async_playwright() as playwright:
-            context = await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self.profile_dir),
-                headless=False,
-                locale="zh-CN",
-                viewport={"width": 1280, "height": 780},
-            )
+            browser = None
+            if config.access_mode == "guest":
+                browser = await playwright.chromium.launch(
+                    channel=MONITOR_BROWSER_CHANNEL,
+                    headless=False,
+                )
+                context = await browser.new_context(
+                    locale="zh-CN",
+                    viewport={"width": 1280, "height": 780},
+                )
+            else:
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(self.profile_dir),
+                    channel=MONITOR_BROWSER_CHANNEL,
+                    headless=False,
+                    locale="zh-CN",
+                    viewport={"width": 1280, "height": 780},
+                )
             try:
                 page = context.pages[0] if context.pages else await context.new_page()
                 page.set_default_timeout(15000)
@@ -345,12 +432,14 @@ class MonitorController:
                     page=page,
                     keyword=config.keyword,
                     relevance_filter=True,
-                    wait_for_login=True,
+                    wait_for_login=config.access_mode == "login",
                     login_timeout=600,
                     newest_first=True,
                 )
 
                 while not self._stop_event.is_set():
+                    safety_paused = False
+                    wait_interval: int | None = None
                     self._scan_now_event.clear()
                     with self._lock:
                         self.scanning = True
@@ -358,12 +447,14 @@ class MonitorController:
                         self.status_text = "正在扫描新发布"
                         self.error = None
                         self.next_scan_at = None
+                        self.scheduled_interval_seconds = None
 
                     try:
                         items = await monitor.scan()
-                        self._process_scan(items, config, notifier)
+                        self._process_scan(items, self.config, notifier)
                     except MonitoringSafetyStop as exc:
-                        self._stop_for_safety(str(exc), notifier)
+                        self._pause_for_safety(str(exc), notifier)
+                        safety_paused = True
                     except Exception as exc:
                         LOGGER.exception("本轮扫描失败")
                         self._handle_scan_error(exc)
@@ -374,18 +465,29 @@ class MonitorController:
                             if self.status == "scanning":
                                 self.status = "waiting"
                                 self.status_text = "等待下一轮"
-                            if self._stop_event.is_set():
+                            if self._stop_event.is_set() or self.status == "safety_stopped":
                                 self.next_scan_at = None
+                                self.scheduled_interval_seconds = None
                             else:
+                                wait_interval = self._take_next_interval_locked()
+                                self.scheduled_interval_seconds = wait_interval
                                 self.next_scan_at = (
-                                    utc_now() + timedelta(seconds=self.config.interval)
+                                    utc_now() + timedelta(seconds=wait_interval)
                                 ).isoformat()
 
                     if self._stop_event.is_set():
                         break
-                    await self._wait_for_next_scan(config.interval)
+                    if safety_paused:
+                        if not await self._wait_for_manual_resume():
+                            break
+                        continue
+                    await self._wait_for_next_scan(
+                        wait_interval or self.config.interval
+                    )
             finally:
                 await context.close()
+                if browser is not None:
+                    await browser.close()
 
     def _process_scan(
         self,
@@ -436,9 +538,19 @@ class MonitorController:
                     keyword=config.keyword,
                     max_price=config.max_price,
                     url=item.url,
+                    image_url=item.image_url,
                 )
             )
             self._log("match", f"¥{item.price:g} {item.title}")
+
+    def _take_next_interval_locked(self) -> int:
+        if not self.config.interval_cycle_enabled:
+            return self.config.interval
+        interval = INTERVAL_CYCLE_SECONDS[self._interval_cycle_index]
+        self._interval_cycle_index = (
+            self._interval_cycle_index + 1
+        ) % len(INTERVAL_CYCLE_SECONDS)
+        return interval
 
     async def _wait_for_next_scan(self, interval: int) -> None:
         deadline = time.monotonic() + interval
@@ -446,7 +558,10 @@ class MonitorController:
             if self._interval_changed_event.is_set():
                 self._interval_changed_event.clear()
                 with self._lock:
-                    interval = self.config.interval
+                    interval = (
+                        self.scheduled_interval_seconds
+                        or self.config.interval
+                    )
                     self.next_scan_at = (
                         utc_now() + timedelta(seconds=interval)
                     ).isoformat()
@@ -455,15 +570,25 @@ class MonitorController:
                 return
             await asyncio.sleep(0.25)
 
-    def _stop_for_safety(self, reason: str, notifier: PopupNotifier) -> None:
-        self._stop_event.set()
+    async def _wait_for_manual_resume(self) -> bool:
+        while not self._stop_event.is_set():
+            if self._resume_event.is_set():
+                self._resume_event.clear()
+                return True
+            await asyncio.sleep(0.25)
+        return False
+
+    def _pause_for_safety(self, reason: str, notifier: PopupNotifier) -> None:
+        self._resume_event.clear()
         with self._lock:
+            self.running = False
             self.error = reason
             self.status = "safety_stopped"
-            self.status_text = "已自动停止"
+            self.status_text = "等待人工验证"
             self.next_scan_at = None
+            self.scheduled_interval_seconds = None
         self._log("error", reason)
-        notifier.notify("闲鱼监控已自动停止", reason)
+        notifier.notify("闲鱼监控已暂停", reason)
 
     def _handle_scan_error(self, exc: Exception) -> None:
         browser_closed = is_browser_closed_error(exc)
@@ -642,7 +767,7 @@ def main() -> int:
     LOGGER.info("面板版本 %s，诊断日志 %s", DASHBOARD_BUILD, LOG_FILE)
     controller = MonitorController(
         state_path=BASE_DIR / "monitor_state.json",
-        profile_dir=BASE_DIR / ".browser-data",
+        profile_dir=BASE_DIR / ".edge-browser-data",
         notification_path=BASE_DIR / "notification_config.json",
     )
     DashboardHandler.controller = controller

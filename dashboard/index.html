@@ -36,16 +36,44 @@
             <input id="keyword" name="keyword" maxlength="80" value="mardi短袖" autocomplete="off">
           </label>
 
+          <fieldset class="mode-field">
+            <legend>访问方式</legend>
+            <div class="segmented-control">
+              <label>
+                <input type="radio" name="access_mode" value="login" checked>
+                <span>登录模式</span>
+              </label>
+              <label>
+                <input type="radio" name="access_mode" value="guest">
+                <span>游客模式</span>
+              </label>
+            </div>
+          </fieldset>
+
           <div class="field-grid">
             <label class="field">
               <span>价格低于</span>
               <span class="price-input"><b>¥</b><input id="maxPrice" name="max_price" type="number" min="0.01" step="0.01" value="60"></span>
             </label>
             <label class="field">
-              <span>刷新间隔</span>
+              <span>固定间隔</span>
               <span class="unit-input"><input id="interval" name="interval" type="number" min="30" max="3600" step="1" value="60" inputmode="numeric"><b>秒</b></span>
             </label>
           </div>
+
+          <fieldset class="mode-field interval-mode-field">
+            <legend>刷新方式</legend>
+            <div class="segmented-control">
+              <label>
+                <input type="radio" name="interval_mode" value="fixed">
+                <span>固定秒数</span>
+              </label>
+              <label>
+                <input type="radio" name="interval_mode" value="cycle" checked>
+                <span>1-5 分钟循环</span>
+              </label>
+            </div>
+          </fieldset>
 
           <label class="toggle-row">
             <strong>系统文字弹窗</strong>
@@ -65,8 +93,8 @@
           </div>
 
           <div class="primary-actions">
-            <button id="startButton" class="button button-primary" type="submit"><span aria-hidden="true">▶</span>启动监控</button>
-            <button id="stopButton" class="button button-stop" type="button"><span aria-hidden="true">■</span>暂停</button>
+            <button id="startButton" class="button button-primary" type="submit"><span aria-hidden="true">▶</span><span id="startButtonLabel">启动监控</span></button>
+            <button id="stopButton" class="button button-stop" type="button"><span aria-hidden="true">■</span><span id="stopButtonLabel">暂停</span></button>
           </div>
         </form>
 

@@ -13,6 +13,7 @@ from notifications import (
     build_dingtalk_url,
     build_webhook_payload,
     build_xianyu_app_entry_url,
+    normalize_listing_image_url,
 )
 
 
@@ -171,21 +172,59 @@ class NotificationTests(unittest.TestCase):
                 "https://www.goofish.com/item?"
                 "id=1234567890123&categoryId=126910002"
             ),
+            image_url="//img.alicdn.com/bao/uploaded/test-product.jpg",
         )
 
         wecom = build_webhook_payload("wecom", notification)
         dingtalk = build_webhook_payload("dingtalk", notification)
 
-        self.assertIn("¥59.00", wecom["markdown"]["content"])
-        self.assertIn("在闲鱼 App 中打开", wecom["markdown"]["content"])
-        self.assertIn(
+        self.assertEqual(wecom["msgtype"], "news")
+        articles = wecom["news"]["articles"]
+        self.assertEqual(len(articles), 2)
+        self.assertIn("¥59.00", articles[0]["title"])
+        self.assertEqual(
+            articles[0]["url"],
             "https://h5.m.goofish.com/item?id=1234567890123",
-            wecom["markdown"]["content"],
         )
-        self.assertIn("网页备用", wecom["markdown"]["content"])
+        self.assertEqual(
+            articles[0]["picurl"],
+            "https://img.alicdn.com/bao/uploaded/test-product.jpg",
+        )
+        self.assertIn("网页备用", articles[1]["title"])
+        self.assertEqual(articles[1]["url"], notification.url)
         self.assertIn("Mardi", dingtalk["markdown"]["text"])
+        self.assertIn(
+            "![商品图片](https://img.alicdn.com/",
+            dingtalk["markdown"]["text"],
+        )
         self.assertIn(notification.url, dingtalk["markdown"]["text"])
         self.assertNotIn("h5.m.goofish.com", dingtalk["markdown"]["text"])
+
+    def test_wecom_without_image_keeps_markdown_links(self) -> None:
+        notification = ListingNotification(
+            title="Mardi 短袖",
+            price=59,
+            keyword="mardi短袖",
+            max_price=60,
+            url="https://www.goofish.com/item?id=1234567890123",
+        )
+
+        payload = build_webhook_payload("wecom", notification)
+
+        self.assertEqual(payload["msgtype"], "markdown")
+        self.assertIn("在闲鱼 App 中打开", payload["markdown"]["content"])
+        self.assertIn("网页备用", payload["markdown"]["content"])
+
+    def test_listing_image_only_accepts_alibaba_https_cdn(self) -> None:
+        self.assertEqual(
+            normalize_listing_image_url("//img.alicdn.com/item.jpg"),
+            "https://img.alicdn.com/item.jpg",
+        )
+        self.assertIsNone(normalize_listing_image_url("http://img.alicdn.com/item.jpg"))
+        self.assertIsNone(normalize_listing_image_url("https://example.com/item.jpg"))
+        self.assertIsNone(
+            normalize_listing_image_url("https://img.alicdn.com.example.com/item.jpg")
+        )
 
     def test_xianyu_web_url_converts_to_safe_mobile_app_entry(self) -> None:
         self.assertEqual(

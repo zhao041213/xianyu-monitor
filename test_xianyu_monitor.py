@@ -16,10 +16,23 @@ from xianyu_monitor import (
     parse_item,
     parse_price,
     select_new_eligible_items,
+    select_product_image_url,
 )
 
 
 class XianyuParsingTests(unittest.TestCase):
+    def test_product_image_skips_placeholder_and_normalizes_cdn_url(self) -> None:
+        self.assertEqual(
+            select_product_image_url(
+                [
+                    "https://img.alicdn.com/imgextra/2-tps-2-2.png",
+                    "//img.alicdn.com/bao/uploaded/product.jpg 2x",
+                ]
+            ),
+            "https://img.alicdn.com/bao/uploaded/product.jpg",
+        )
+        self.assertIsNone(select_product_image_url(["https://example.com/product.jpg"]))
+
     def test_popup_notifier_can_be_enabled_after_startup(self) -> None:
         with patch("xianyu_monitor.threading.Thread") as thread_class:
             notifier = PopupNotifier(enabled=False)

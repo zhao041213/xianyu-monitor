@@ -67,8 +67,30 @@ class SearchItem:
     published_label: str | None = None
 
 
+IMAGE_ATTRIBUTES = ("src", "data-src", "data-lazy-src", "data-ks-lazyload", "srcset")
+IMAGE_PLACEHOLDER_MARKERS = ("2-tps-2-2.png", "data:image")
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def select_product_image_url(candidates: list[str | None]) -> str | None:
+    for raw_candidate in candidates:
+        if not raw_candidate:
+            continue
+        candidate = raw_candidate.split(",", maxsplit=1)[0].strip().split(" ", maxsplit=1)[0]
+        if not candidate or any(marker in candidate for marker in IMAGE_PLACEHOLDER_MARKERS):
+            continue
+        if candidate.startswith("//"):
+            candidate = f"https:{candidate}"
+        try:
+            parsed = urlparse(candidate)
+        except ValueError:
+            continue
+        if parsed.scheme == "https" and (parsed.hostname or "").endswith(".alicdn.com"):
+            return candidate
+    return None
 
 
 def detect_blocking_issue(
@@ -88,17 +110,17 @@ def detect_blocking_issue(
         or parsed_url.path.casefold().startswith("/login")
         or any(marker in normalized_body for marker in LOGIN_ABNORMAL_MARKERS)
     ):
-        return "检测到闲鱼登录异常，监控已自动停止。请重新登录后手动启动。"
+        return "检测到闲鱼登录异常，监控已暂停。请在保留的页面中登录后继续监控。"
 
     if (
         captcha_visible
         or any(marker in location for marker in CAPTCHA_URL_MARKERS)
         or any(marker in normalized_body for marker in CAPTCHA_TEXT_MARKERS)
     ):
-        return "检测到验证码或安全验证，监控已自动停止。请人工完成验证后再启动。"
+        return "检测到验证码或安全验证，监控已暂停。请在保留的页面中完成验证后继续监控。"
 
     if any(marker in normalized_body for marker in ACCESS_LIMIT_MARKERS):
-        return "检测到访问受限或异常流量提示，监控已自动停止。请稍后再手动启动。"
+        return "检测到访问受限或异常流量提示，监控已暂停。请保留页面并稍后人工处理。"
 
     return None
 
@@ -428,11 +450,11 @@ class XianyuMonitor:
                     await self.page.wait_for_timeout(3000)
                 else:
                     raise MonitoringSafetyStop(
-                        "检测到闲鱼登录异常，监控已自动停止。请重新登录后手动启动。"
+                        "检测到闲鱼登录异常，监控已暂停。请在保留的页面中登录后继续监控。"
                     )
         elif login_visible:
             raise MonitoringSafetyStop(
-                "检测到闲鱼登录状态失效，监控已自动停止。请重新登录后手动启动。"
+                "检测到闲鱼登录状态失效，监控已暂停。请在保留的页面中登录后继续监控。"
             )
 
         body_text = await self._read_page_text_or_stop()
@@ -456,10 +478,13 @@ class XianyuMonitor:
             text = await card.inner_text()
             if not href:
                 continue
-            image_url: str | None = None
+            image_candidates: list[str | None] = []
             images = card.locator("img")
-            if await images.count():
-                image_url = await images.first.get_attribute("src")
+            for image_index in range(min(await images.count(), 3)):
+                image = images.nth(image_index)
+                for attribute in IMAGE_ATTRIBUTES:
+                    image_candidates.append(await image.get_attribute(attribute))
+            image_url = select_product_image_url(image_candidates)
             item = parse_item(
                 href=href,
                 text=text,
@@ -537,7 +562,7 @@ class XianyuMonitor:
                 return
             await self.page.wait_for_timeout(1000)
         raise MonitoringSafetyStop(
-            "等待闲鱼登录超时，监控已自动停止。请重新登录后手动启动。"
+            "等待闲鱼登录超时，监控已暂停。请在保留的页面中登录后继续监控。"
         )
 
 
