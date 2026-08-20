@@ -14,6 +14,20 @@ class FakeNotifier:
         self.messages.append((title, message))
 
 
+class FakeNotificationManager:
+    def __init__(self) -> None:
+        self.listings = []
+
+    def public_snapshot(self) -> dict:
+        return {
+            "wecom": {"enabled": False, "configured": False},
+            "dingtalk": {"enabled": False, "configured": False},
+        }
+
+    def notify_listing(self, notification) -> None:
+        self.listings.append(notification)
+
+
 class DashboardTests(unittest.TestCase):
     def test_default_config_matches_requested_watch(self) -> None:
         config = MonitorConfig.from_payload({})
@@ -56,7 +70,12 @@ class DashboardTests(unittest.TestCase):
     def test_first_scan_is_silent_then_only_new_low_price_item_alerts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
-            controller = MonitorController(root / "state.json", root / "profile")
+            notifications = FakeNotificationManager()
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=notifications,
+            )
             config = MonitorConfig()
             notifier = FakeNotifier()
 
@@ -81,6 +100,8 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual([alert["item_id"] for alert in alerts], ["new-low"])
             self.assertEqual(alerts[0]["keyword"], "mardi短袖")
             self.assertEqual(len(notifier.messages), 1)
+            self.assertEqual(len(notifications.listings), 1)
+            self.assertEqual(notifications.listings[0].title, "新低价")
 
 
 if __name__ == "__main__":

@@ -5,3 +5,5 @@ __pycache__/
 *.py[cod]
 monitor_state.json
 monitor_state.json.tmp
+notification_config.json
+notification_config.json.tmp

@@ -53,6 +53,17 @@
             <span class="toggle" aria-hidden="true"></span>
           </label>
 
+          <div class="notification-overview">
+            <div class="notification-overview-heading">
+              <strong>消息通知</strong>
+              <button id="notificationSettingsButton" class="text-button" type="button">设置</button>
+            </div>
+            <div class="notification-route-list" aria-label="消息通知状态">
+              <span><i id="wecomStatusDot" class="route-dot"></i>企业微信 <b id="wecomStatusText">未配置</b></span>
+              <span><i id="dingtalkStatusDot" class="route-dot"></i>钉钉 <b id="dingtalkStatusText">未配置</b></span>
+            </div>
+          </div>
+
           <div class="primary-actions">
             <button id="startButton" class="button button-primary" type="submit"><span aria-hidden="true">▶</span>启动监控</button>
             <button id="stopButton" class="button button-stop" type="button"><span aria-hidden="true">■</span>暂停</button>
@@ -113,6 +124,81 @@
       </section>
     </main>
   </div>
+
+  <dialog id="notificationDialog" class="notification-dialog" aria-labelledby="notificationDialogTitle">
+    <div class="dialog-frame">
+      <header class="dialog-header">
+        <div>
+          <span class="section-label">通知渠道</span>
+          <h2 id="notificationDialogTitle">消息通知</h2>
+        </div>
+        <button id="notificationCloseButton" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button>
+      </header>
+
+      <form id="notificationForm">
+        <section class="channel-setting" aria-labelledby="wecomChannelTitle">
+          <header class="channel-header">
+            <div class="channel-identity">
+              <span class="channel-mark wecom" aria-hidden="true">企</span>
+              <div>
+                <strong id="wecomChannelTitle">企业微信</strong>
+                <span id="wecomDialogStatus" class="channel-state">未配置</span>
+              </div>
+            </div>
+            <label class="switch-control" title="启用企业微信通知">
+              <input id="wecomEnabled" type="checkbox">
+              <span class="toggle" aria-hidden="true"></span>
+              <span class="sr-only">启用企业微信通知</span>
+            </label>
+          </header>
+          <label class="field dialog-field">
+            <span>Webhook 地址</span>
+            <input id="wecomWebhook" type="password" autocomplete="new-password" spellcheck="false">
+          </label>
+          <div class="channel-actions">
+            <button id="wecomTestButton" class="button button-secondary" type="button">测试企业微信</button>
+            <button id="wecomClearButton" class="button button-remove" type="button">移除</button>
+          </div>
+        </section>
+
+        <section class="channel-setting" aria-labelledby="dingtalkChannelTitle">
+          <header class="channel-header">
+            <div class="channel-identity">
+              <span class="channel-mark dingtalk" aria-hidden="true">钉</span>
+              <div>
+                <strong id="dingtalkChannelTitle">钉钉</strong>
+                <span id="dingtalkDialogStatus" class="channel-state">未配置</span>
+              </div>
+            </div>
+            <label class="switch-control" title="启用钉钉通知">
+              <input id="dingtalkEnabled" type="checkbox">
+              <span class="toggle" aria-hidden="true"></span>
+              <span class="sr-only">启用钉钉通知</span>
+            </label>
+          </header>
+          <div class="dialog-field-grid">
+            <label class="field dialog-field">
+              <span>Webhook 地址</span>
+              <input id="dingtalkWebhook" type="password" autocomplete="new-password" spellcheck="false">
+            </label>
+            <label class="field dialog-field">
+              <span>加签密钥（可选）</span>
+              <input id="dingtalkSecret" type="password" autocomplete="new-password" spellcheck="false">
+            </label>
+          </div>
+          <div class="channel-actions">
+            <button id="dingtalkTestButton" class="button button-secondary" type="button">测试钉钉</button>
+            <button id="dingtalkClearButton" class="button button-remove" type="button">移除</button>
+          </div>
+        </section>
+
+        <footer class="dialog-footer">
+          <button id="notificationCancelButton" class="button button-secondary" type="button">取消</button>
+          <button id="notificationSaveButton" class="button button-primary" type="submit">保存通知设置</button>
+        </footer>
+      </form>
+    </div>
+  </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/app.js" defer></script>

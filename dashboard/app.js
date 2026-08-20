@@ -12,6 +12,27 @@ const elements = {
   maxPrice: document.querySelector("#maxPrice"),
   interval: document.querySelector("#interval"),
   popupEnabled: document.querySelector("#popupEnabled"),
+  notificationSettingsButton: document.querySelector("#notificationSettingsButton"),
+  notificationDialog: document.querySelector("#notificationDialog"),
+  notificationForm: document.querySelector("#notificationForm"),
+  notificationCloseButton: document.querySelector("#notificationCloseButton"),
+  notificationCancelButton: document.querySelector("#notificationCancelButton"),
+  notificationSaveButton: document.querySelector("#notificationSaveButton"),
+  wecomEnabled: document.querySelector("#wecomEnabled"),
+  wecomWebhook: document.querySelector("#wecomWebhook"),
+  wecomTestButton: document.querySelector("#wecomTestButton"),
+  wecomClearButton: document.querySelector("#wecomClearButton"),
+  wecomStatusDot: document.querySelector("#wecomStatusDot"),
+  wecomStatusText: document.querySelector("#wecomStatusText"),
+  wecomDialogStatus: document.querySelector("#wecomDialogStatus"),
+  dingtalkEnabled: document.querySelector("#dingtalkEnabled"),
+  dingtalkWebhook: document.querySelector("#dingtalkWebhook"),
+  dingtalkSecret: document.querySelector("#dingtalkSecret"),
+  dingtalkTestButton: document.querySelector("#dingtalkTestButton"),
+  dingtalkClearButton: document.querySelector("#dingtalkClearButton"),
+  dingtalkStatusDot: document.querySelector("#dingtalkStatusDot"),
+  dingtalkStatusText: document.querySelector("#dingtalkStatusText"),
+  dingtalkDialogStatus: document.querySelector("#dingtalkDialogStatus"),
   startButton: document.querySelector("#startButton"),
   stopButton: document.querySelector("#stopButton"),
   scanButton: document.querySelector("#scanButton"),
@@ -87,6 +108,104 @@ function safeUrl(value) {
   }
 }
 
+function channelStatus(channel = {}) {
+  if (channel.enabled && channel.last_result === "error") return "发送失败";
+  if (channel.enabled) return "已启用";
+  if (channel.configured) return "已关闭";
+  return "未配置";
+}
+
+function renderNotificationChannel(name, channel = {}) {
+  const status = channelStatus(channel);
+  const dot = elements[`${name}StatusDot`];
+  const summary = elements[`${name}StatusText`];
+  const dialogStatus = elements[`${name}DialogStatus`];
+  const clearButton = elements[`${name}ClearButton`];
+
+  dot.className = `route-dot ${channel.enabled ? "active" : channel.configured ? "ready" : ""} ${channel.enabled && channel.last_result === "error" ? "error" : ""}`;
+  summary.textContent = status;
+  dialogStatus.textContent = channel.enabled && channel.last_error
+    ? channel.last_error
+    : status;
+  dialogStatus.classList.toggle("error", channel.enabled && channel.last_result === "error");
+  clearButton.disabled = !channel.configured;
+}
+
+function renderNotifications(notifications = {}) {
+  renderNotificationChannel("wecom", notifications.wecom);
+  renderNotificationChannel("dingtalk", notifications.dingtalk);
+}
+
+function openNotificationDialog() {
+  const notifications = state.lastSnapshot?.notifications || {};
+  const wecom = notifications.wecom || {};
+  const dingtalk = notifications.dingtalk || {};
+
+  elements.wecomEnabled.checked = Boolean(wecom.enabled);
+  elements.dingtalkEnabled.checked = Boolean(dingtalk.enabled);
+  elements.wecomWebhook.value = "";
+  elements.dingtalkWebhook.value = "";
+  elements.dingtalkSecret.value = "";
+  elements.wecomWebhook.placeholder = wecom.configured ? "已配置" : "";
+  elements.dingtalkWebhook.placeholder = dingtalk.configured ? "已配置" : "";
+  elements.dingtalkSecret.placeholder = dingtalk.secret_configured ? "已配置" : "";
+  elements.notificationDialog.showModal();
+}
+
+function notificationPayloadFromForm() {
+  return {
+    wecom: {
+      enabled: elements.wecomEnabled.checked,
+      webhook_url: elements.wecomWebhook.value.trim(),
+    },
+    dingtalk: {
+      enabled: elements.dingtalkEnabled.checked,
+      webhook_url: elements.dingtalkWebhook.value.trim(),
+      secret: elements.dingtalkSecret.value.trim(),
+    },
+  };
+}
+
+async function testNotification(channel) {
+  const button = elements[`${channel}TestButton`];
+  const payload = notificationPayloadFromForm()[channel];
+  button.disabled = true;
+  try {
+    const response = await api("/api/notifications/test", {
+      method: "POST",
+      body: JSON.stringify({ channel, ...payload }),
+    });
+    render(response.snapshot);
+    showToast(response.message);
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function clearNotification(channel) {
+  const channelName = channel === "wecom" ? "企业微信" : "钉钉";
+  if (!window.confirm(`移除${channelName}通知配置？`)) return;
+  try {
+    const snapshot = await api("/api/notifications/clear", {
+      method: "POST",
+      body: JSON.stringify({ channel }),
+    });
+    render(snapshot);
+    elements[`${channel}Enabled`].checked = false;
+    elements[`${channel}Webhook`].value = "";
+    elements[`${channel}Webhook`].placeholder = "";
+    if (channel === "dingtalk") {
+      elements.dingtalkSecret.value = "";
+      elements.dingtalkSecret.placeholder = "";
+    }
+    showToast(`${channelName}通知配置已移除`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 function render(snapshot) {
   state.lastSnapshot = snapshot;
   const running = snapshot.running;
@@ -118,6 +237,7 @@ function render(snapshot) {
   elements.itemCount.textContent = snapshot.items_last_scan;
   elements.knownCount.textContent = snapshot.known_count;
   elements.alertCount.textContent = `${snapshot.alerts.length} 条`;
+  renderNotifications(snapshot.notifications);
 
   elements.errorBanner.hidden = !snapshot.error;
   elements.errorBanner.textContent = snapshot.error || "";
@@ -231,6 +351,41 @@ elements.clearButton.addEventListener("click", async () => {
     showToast(error.message);
   }
 });
+
+elements.notificationSettingsButton.addEventListener("click", openNotificationDialog);
+elements.notificationCloseButton.addEventListener("click", () => elements.notificationDialog.close());
+elements.notificationCancelButton.addEventListener("click", () => elements.notificationDialog.close());
+elements.notificationDialog.addEventListener("click", (event) => {
+  if (event.target === elements.notificationDialog) elements.notificationDialog.close();
+});
+elements.notificationDialog.addEventListener("close", () => {
+  elements.wecomWebhook.value = "";
+  elements.dingtalkWebhook.value = "";
+  elements.dingtalkSecret.value = "";
+});
+
+elements.notificationForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  elements.notificationSaveButton.disabled = true;
+  try {
+    const snapshot = await api("/api/notifications/save", {
+      method: "POST",
+      body: JSON.stringify(notificationPayloadFromForm()),
+    });
+    render(snapshot);
+    elements.notificationDialog.close();
+    showToast("通知设置已保存");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    elements.notificationSaveButton.disabled = false;
+  }
+});
+
+elements.wecomTestButton.addEventListener("click", () => testNotification("wecom"));
+elements.dingtalkTestButton.addEventListener("click", () => testNotification("dingtalk"));
+elements.wecomClearButton.addEventListener("click", () => clearNotification("wecom"));
+elements.dingtalkClearButton.addEventListener("click", () => clearNotification("dingtalk"));
 
 refresh();
 window.setInterval(refresh, 2000);

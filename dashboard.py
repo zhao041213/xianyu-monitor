@@ -15,6 +15,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from notifications import (
+    CHANNEL_NAMES,
+    ListingNotification,
+    NotificationManager,
+    WebhookDeliveryError,
+)
 from xianyu_monitor import (
     PopupNotifier,
     MonitoringSafetyStop,
@@ -73,7 +79,13 @@ class MonitorConfig:
 
 
 class MonitorController:
-    def __init__(self, state_path: Path, profile_dir: Path) -> None:
+    def __init__(
+        self,
+        state_path: Path,
+        profile_dir: Path,
+        notification_path: Path | None = None,
+        notifications: NotificationManager | None = None,
+    ) -> None:
         self.state_store = StateStore(state_path)
         self.profile_dir = profile_dir.resolve()
         self.config = MonitorConfig()
@@ -95,6 +107,10 @@ class MonitorController:
         self.items_last_scan = 0
         self.new_items_last_scan = 0
         self.matched_last_scan = 0
+        self.notifications = notifications or NotificationManager(
+            notification_path or state_path.with_name("notification_config.json"),
+            result_callback=self._notification_result,
+        )
 
     def start(self, payload: dict[str, Any] | None = None) -> bool:
         config = MonitorConfig.from_payload(payload or {})
@@ -154,6 +170,19 @@ class MonitorController:
         self.state_store.clear_alerts(self.config.keyword)
         self._log("info", f"“{self.config.keyword}”的推送记录已清空")
 
+    def save_notifications(self, payload: dict[str, Any]) -> None:
+        self.notifications.save(payload)
+        self._log("info", "通知设置已保存")
+
+    def clear_notification(self, payload: dict[str, Any]) -> None:
+        channel = str(payload.get("channel", ""))
+        self.notifications.clear(channel)
+        self._log("info", f"{CHANNEL_NAMES[channel]}通知配置已移除")
+
+    def test_notification(self, payload: dict[str, Any]) -> str:
+        channel = str(payload.get("channel", ""))
+        return self.notifications.test(channel, payload)
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             config = asdict(self.config)
@@ -173,6 +202,7 @@ class MonitorController:
                 "matched_last_scan": self.matched_last_scan,
                 "known_count": known_count,
                 "config": config,
+                "notifications": self.notifications.public_snapshot(),
                 "alerts": self.state_store.alert_snapshot(self.config.keyword),
                 "logs": list(self._logs),
             }
@@ -304,6 +334,15 @@ class MonitorController:
                 "闲鱼新商品提醒",
                 f"{format_announcement(item, config.max_price)}\n{item.url}",
             )
+            self.notifications.notify_listing(
+                ListingNotification(
+                    title=item.title,
+                    price=item.price,
+                    keyword=config.keyword,
+                    max_price=config.max_price,
+                    url=item.url,
+                )
+            )
             self._log("match", f"¥{item.price:g} {item.title}")
 
     async def _wait_for_next_scan(self, interval: int) -> None:
@@ -328,6 +367,13 @@ class MonitorController:
         with self._lock:
             self._logs.appendleft(entry)
         getattr(LOGGER, "error" if level == "error" else "info")(message)
+
+    def _notification_result(self, channel: str, success: bool, message: str) -> None:
+        channel_name = CHANNEL_NAMES.get(channel, channel)
+        if success:
+            self._log("info", f"{channel_name}：{message}")
+        else:
+            self._log("error", f"{channel_name}：{message}")
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -372,9 +418,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.controller.clear_alerts()
                 self._send_json(self.controller.snapshot())
                 return
+            if self.path == "/api/notifications/save":
+                self.controller.save_notifications(payload)
+                self._send_json(self.controller.snapshot())
+                return
+            if self.path == "/api/notifications/test":
+                message = self.controller.test_notification(payload)
+                self._send_json(
+                    {"message": message, "snapshot": self.controller.snapshot()}
+                )
+                return
+            if self.path == "/api/notifications/clear":
+                self.controller.clear_notification(payload)
+                self._send_json(self.controller.snapshot())
+                return
             self.send_error(HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except WebhookDeliveryError as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         except Exception as exc:
             LOGGER.exception("API 请求处理失败")
             self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -431,6 +493,7 @@ def main() -> int:
     controller = MonitorController(
         state_path=BASE_DIR / "monitor_state.json",
         profile_dir=BASE_DIR / ".browser-data",
+        notification_path=BASE_DIR / "notification_config.json",
     )
     DashboardHandler.controller = controller
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
