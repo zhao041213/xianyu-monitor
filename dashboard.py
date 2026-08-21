@@ -39,9 +39,10 @@ LOGGER = logging.getLogger("xianyu-dashboard")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "dashboard"
 LOG_FILE = BASE_DIR / "dashboard_debug.log"
-DASHBOARD_BUILD = "2026.08.21-edge-cycle-1"
+DASHBOARD_BUILD = "2026.08.21-long-session-1"
 MONITOR_BROWSER_CHANNEL = "msedge"
 INTERVAL_CYCLE_SECONDS = (60, 120, 180, 240, 300)
+ERROR_COOLDOWN_SECONDS = (15 * 60, 30 * 60, 60 * 60)
 ACCESS_MODES = {"login", "guest"}
 
 
@@ -173,6 +174,13 @@ class MonitorController:
         self._interval_changed_event = threading.Event()
         self._interval_cycle_index = 0
         self.scheduled_interval_seconds: int | None = None
+        self.consecutive_scan_errors = 0
+        self.cooldown_seconds = 0
+        self.page_request_count = 0
+        self.safety_pause_count = 0
+        self.session_started_at: str | None = None
+        self._session_started_monotonic: float | None = None
+        self._session_ended_monotonic: float | None = None
         self._thread: threading.Thread | None = None
         self._popup_notifier: PopupNotifier | None = None
         self._logs: deque[dict[str, str]] = deque(maxlen=120)
@@ -230,6 +238,13 @@ class MonitorController:
                 self._interval_changed_event.clear()
                 self._interval_cycle_index = 0
                 self.scheduled_interval_seconds = None
+                self.consecutive_scan_errors = 0
+                self.cooldown_seconds = 0
+                self.page_request_count = 0
+                self.safety_pause_count = 0
+                self.session_started_at = None
+                self._session_started_monotonic = None
+                self._session_ended_monotonic = None
                 self.running = True
                 self.scanning = False
                 self.status = "starting"
@@ -311,7 +326,10 @@ class MonitorController:
             self.config = MonitorConfig.from_payload(config_payload)
             self._interval_cycle_index = 0
             if self.running and not self.scanning:
-                interval = self._take_next_interval_locked()
+                interval = (
+                    self.cooldown_seconds
+                    or self._take_next_interval_locked()
+                )
                 self.scheduled_interval_seconds = interval
                 self.next_scan_at = (
                     utc_now() + timedelta(seconds=interval)
@@ -339,6 +357,31 @@ class MonitorController:
         channel = str(payload.get("channel", ""))
         return self.notifications.test(channel, payload)
 
+    def _begin_browser_session(self) -> None:
+        with self._lock:
+            self.session_started_at = iso_now()
+            self._session_started_monotonic = time.monotonic()
+            self._session_ended_monotonic = None
+            self.page_request_count = 0
+            self.safety_pause_count = 0
+            self.consecutive_scan_errors = 0
+            self.cooldown_seconds = 0
+
+    def _finish_browser_session(self) -> None:
+        with self._lock:
+            if self._session_started_monotonic is not None:
+                self._session_ended_monotonic = time.monotonic()
+
+    def _count_page_request(self, _request: Any) -> None:
+        with self._lock:
+            self.page_request_count += 1
+
+    def _session_uptime_seconds_locked(self) -> int:
+        if self._session_started_monotonic is None:
+            return 0
+        endpoint = self._session_ended_monotonic or time.monotonic()
+        return max(0, int(endpoint - self._session_started_monotonic))
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             config = asdict(self.config)
@@ -352,6 +395,7 @@ class MonitorController:
                     "file_logging": True,
                     "guest_mode": True,
                     "verification_pause": True,
+                    "long_session_metrics": True,
                 },
                 "diagnostics": {"log_file": str(LOG_FILE)},
                 "running": self.running,
@@ -368,6 +412,14 @@ class MonitorController:
                 "new_items_last_scan": self.new_items_last_scan,
                 "matched_last_scan": self.matched_last_scan,
                 "known_count": known_count,
+                "session": {
+                    "started_at": self.session_started_at,
+                    "uptime_seconds": self._session_uptime_seconds_locked(),
+                    "page_request_count": self.page_request_count,
+                    "safety_pause_count": self.safety_pause_count,
+                    "consecutive_scan_errors": self.consecutive_scan_errors,
+                    "cooldown_seconds": self.cooldown_seconds,
+                },
                 "config": config,
                 "notifications": self.notifications.public_snapshot(),
                 "alerts": self.state_store.alert_snapshot(self.config.keyword),
@@ -386,6 +438,7 @@ class MonitorController:
                 self.status_text = "监控启动失败"
             self._log("error", message)
         finally:
+            self._finish_browser_session()
             with self._lock:
                 self._popup_notifier = None
                 self.running = False
@@ -426,8 +479,19 @@ class MonitorController:
                     viewport={"width": 1280, "height": 780},
                 )
             try:
-                page = context.pages[0] if context.pages else await context.new_page()
+                self._begin_browser_session()
+                pages = list(context.pages)
+                page = pages[0] if pages else await context.new_page()
+                for extra_page in pages[1:]:
+                    await extra_page.close()
                 page.set_default_timeout(15000)
+                page.on("request", self._count_page_request)
+                session_mode = (
+                    "Edge 长期会话已建立：单页面运行，保留 Cookie 和缓存"
+                    if config.access_mode == "login"
+                    else "Edge 游客会话已建立：单页面运行"
+                )
+                self._log("info", session_mode)
                 monitor = XianyuMonitor(
                     page=page,
                     keyword=config.keyword,
@@ -440,24 +504,27 @@ class MonitorController:
                 while not self._stop_event.is_set():
                     safety_paused = False
                     wait_interval: int | None = None
+                    error_cooldown: int | None = None
                     self._scan_now_event.clear()
                     with self._lock:
                         self.scanning = True
                         self.status = "scanning"
                         self.status_text = "正在扫描新发布"
                         self.error = None
+                        self.cooldown_seconds = 0
                         self.next_scan_at = None
                         self.scheduled_interval_seconds = None
 
                     try:
                         items = await monitor.scan()
                         self._process_scan(items, self.config, notifier)
+                        self._record_scan_success()
                     except MonitoringSafetyStop as exc:
                         self._pause_for_safety(str(exc), notifier)
                         safety_paused = True
                     except Exception as exc:
                         LOGGER.exception("本轮扫描失败")
-                        self._handle_scan_error(exc)
+                        error_cooldown = self._handle_scan_error(exc)
                     finally:
                         with self._lock:
                             self.scanning = False
@@ -469,7 +536,10 @@ class MonitorController:
                                 self.next_scan_at = None
                                 self.scheduled_interval_seconds = None
                             else:
-                                wait_interval = self._take_next_interval_locked()
+                                wait_interval = (
+                                    error_cooldown
+                                    or self._take_next_interval_locked()
+                                )
                                 self.scheduled_interval_seconds = wait_interval
                                 self.next_scan_at = (
                                     utc_now() + timedelta(seconds=wait_interval)
@@ -587,19 +657,52 @@ class MonitorController:
             self.status_text = "等待人工验证"
             self.next_scan_at = None
             self.scheduled_interval_seconds = None
+            self.safety_pause_count += 1
+            self.consecutive_scan_errors = 0
+            self.cooldown_seconds = 0
         self._log("error", reason)
         notifier.notify("闲鱼监控已暂停", reason)
 
-    def _handle_scan_error(self, exc: Exception) -> None:
+    def _record_scan_success(self) -> None:
+        with self._lock:
+            recovered = self.consecutive_scan_errors > 0
+            self.consecutive_scan_errors = 0
+            self.cooldown_seconds = 0
+        if recovered:
+            self._log("info", "扫描已恢复正常，继续使用常规刷新间隔")
+
+    def _handle_scan_error(self, exc: Exception) -> int | None:
         browser_closed = is_browser_closed_error(exc)
         message = monitor_error_message(exc, during_scan=True)
         with self._lock:
-            self.error = f"{message}。详细信息见 {LOG_FILE.name}"
             self.status = "error"
-            self.status_text = "监控浏览器已关闭" if browser_closed else "本轮扫描失败"
             if browser_closed:
+                cooldown = None
+                self.cooldown_seconds = 0
+                self.error = f"{message}。详细信息见 {LOG_FILE.name}"
+                self.status_text = "监控浏览器已关闭"
                 self._stop_event.set()
-        self._log("error", message)
+            else:
+                self.consecutive_scan_errors += 1
+                cooldown = ERROR_COOLDOWN_SECONDS[
+                    min(
+                        self.consecutive_scan_errors - 1,
+                        len(ERROR_COOLDOWN_SECONDS) - 1,
+                    )
+                ]
+                self.cooldown_seconds = cooldown
+                cooldown_minutes = cooldown // 60
+                self.error = (
+                    f"{message}。将在 {cooldown_minutes} 分钟后重试。"
+                    f"详细信息见 {LOG_FILE.name}"
+                )
+                self.status = "cooldown"
+                self.status_text = f"异常冷却 {cooldown_minutes} 分钟"
+        if cooldown is None:
+            self._log("error", message)
+        else:
+            self._log("error", f"{message}；将在 {cooldown // 60} 分钟后重试")
+        return cooldown
 
     def _log(self, level: str, message: str) -> None:
         entry = {"time": iso_now(), "level": level, "message": message}

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from dashboard import (
     DASHBOARD_BUILD,
+    ERROR_COOLDOWN_SECONDS,
     INTERVAL_CYCLE_SECONDS,
     MonitorConfig,
     MonitorController,
@@ -117,7 +118,29 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(snapshot["capabilities"]["interval_cycle"])
             self.assertTrue(snapshot["capabilities"]["live_popup"])
             self.assertTrue(snapshot["capabilities"]["file_logging"])
+            self.assertTrue(snapshot["capabilities"]["long_session_metrics"])
             self.assertTrue(snapshot["diagnostics"]["log_file"].endswith("dashboard_debug.log"))
+            self.assertEqual(snapshot["session"]["uptime_seconds"], 0)
+            self.assertEqual(snapshot["session"]["page_request_count"], 0)
+
+    def test_browser_session_metrics_count_requests_without_storing_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+
+            controller._begin_browser_session()
+            controller._count_page_request(object())
+            controller._count_page_request(object())
+            snapshot = controller.snapshot()
+
+            self.assertIsNotNone(snapshot["session"]["started_at"])
+            self.assertGreaterEqual(snapshot["session"]["uptime_seconds"], 0)
+            self.assertEqual(snapshot["session"]["page_request_count"], 2)
+            controller._finish_browser_session()
 
     def test_browser_profile_conflict_has_readable_error(self) -> None:
         error = RuntimeError(
@@ -153,11 +176,37 @@ class DashboardTests(unittest.TestCase):
                 notifications=FakeNotificationManager(),
             )
 
-            controller._handle_scan_error(error)
+            cooldown = controller._handle_scan_error(error)
 
+            self.assertIsNone(cooldown)
             self.assertTrue(controller._stop_event.is_set())
+            self.assertEqual(controller.cooldown_seconds, 0)
             self.assertEqual(controller.status, "error")
             self.assertEqual(controller.status_text, "监控浏览器已关闭")
+
+    def test_recoverable_errors_use_progressive_cooldown_and_reset_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+            error = RuntimeError("Page.goto: timeout")
+
+            cooldowns = [controller._handle_scan_error(error) for _ in range(4)]
+
+            self.assertEqual(cooldowns, [900, 1800, 3600, 3600])
+            self.assertEqual(ERROR_COOLDOWN_SECONDS, (900, 1800, 3600))
+            self.assertEqual(controller.consecutive_scan_errors, 4)
+            self.assertEqual(controller.cooldown_seconds, 3600)
+            self.assertEqual(controller.status, "cooldown")
+            self.assertEqual(controller.status_text, "异常冷却 60 分钟")
+
+            controller._record_scan_success()
+
+            self.assertEqual(controller.consecutive_scan_errors, 0)
+            self.assertEqual(controller.cooldown_seconds, 0)
 
     def test_diagnostic_redacts_webhook_credentials(self) -> None:
         message = redact_diagnostic(
@@ -188,6 +237,23 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(controller.scheduled_interval_seconds, 137)
             self.assertTrue(controller._interval_changed_event.is_set())
             self.assertIsNotNone(controller.next_scan_at)
+
+    def test_interval_change_does_not_shorten_active_error_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+            controller.running = True
+            controller.cooldown_seconds = 900
+
+            controller.set_interval(
+                {"interval": 60, "interval_cycle_enabled": True}
+            )
+
+            self.assertEqual(controller.scheduled_interval_seconds, 900)
 
     def test_popup_setting_updates_config_and_active_notifier(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -234,6 +300,8 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(controller.status, "safety_stopped")
             self.assertEqual(controller.status_text, "等待人工验证")
             self.assertEqual(controller.error, "检测到访问受限")
+            self.assertEqual(controller.safety_pause_count, 1)
+            self.assertEqual(controller.cooldown_seconds, 0)
             self.assertEqual(len(notifier.messages), 1)
 
     def test_safety_pause_resumes_existing_monitor_thread(self) -> None:

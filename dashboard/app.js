@@ -53,6 +53,9 @@ const elements = {
   nextScan: document.querySelector("#nextScan"),
   itemCount: document.querySelector("#itemCount"),
   knownCount: document.querySelector("#knownCount"),
+  sessionUptime: document.querySelector("#sessionUptime"),
+  requestCount: document.querySelector("#requestCount"),
+  safetyPauseCount: document.querySelector("#safetyPauseCount"),
   alertCount: document.querySelector("#alertCount"),
   priceTitle: document.querySelector("#priceTitle"),
   keywordTitle: document.querySelector("#keywordTitle"),
@@ -108,7 +111,8 @@ function hasLiveControlCapabilities(snapshot) {
     snapshot?.capabilities?.live_interval
     && snapshot?.capabilities?.interval_cycle
     && snapshot?.capabilities?.live_popup
-    && snapshot?.capabilities?.file_logging,
+    && snapshot?.capabilities?.file_logging
+    && snapshot?.capabilities?.long_session_metrics,
   );
 }
 
@@ -179,6 +183,17 @@ function formatInterval(value) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds <= 0) return "";
   return seconds % 60 === 0 ? `${seconds / 60}分` : `${seconds}秒`;
+}
+
+function formatSessionUptime(seconds, startedAt) {
+  if (!startedAt) return "--";
+  const totalSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainingSeconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}时 ${minutes}分`;
+  if (minutes > 0) return `${minutes}分 ${remainingSeconds}秒`;
+  return `${remainingSeconds}秒`;
 }
 
 function formatFoundAt(value) {
@@ -361,6 +376,15 @@ function render(snapshot) {
       : nextScanTime;
   elements.itemCount.textContent = snapshot.items_last_scan;
   elements.knownCount.textContent = snapshot.known_count;
+  const session = snapshot.session || {};
+  elements.sessionUptime.textContent = formatSessionUptime(
+    session.uptime_seconds,
+    session.started_at,
+  );
+  elements.requestCount.textContent = Number(
+    session.page_request_count || 0,
+  ).toLocaleString("zh-CN");
+  elements.safetyPauseCount.textContent = `${Number(session.safety_pause_count || 0)} 次`;
   elements.alertCount.textContent = `${snapshot.alerts.length} 条`;
   renderNotifications(snapshot.notifications);
 

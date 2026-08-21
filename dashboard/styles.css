@@ -375,6 +375,32 @@ input:disabled { background: #eef0ec; color: #8d948c; cursor: not-allowed; }
   font-weight: 700;
 }
 
+.session-health {
+  min-height: 58px;
+  margin: -2px 0 18px;
+  padding: 10px 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.session-health div { min-width: 0; padding: 0 9px; }
+.session-health div:first-child { padding-left: 0; }
+.session-health div:last-child { padding-right: 0; }
+.session-health div + div { border-left: 1px solid var(--line); }
+.session-health span {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+.session-health strong {
+  display: block;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  font-family: Bahnschrift, "Microsoft YaHei UI", sans-serif;
+  font-size: 12px;
+}
+
 .activity { margin-top: 28px; }
 .activity-list {
   margin: 12px 0 0;
