@@ -39,7 +39,7 @@ LOGGER = logging.getLogger("xianyu-dashboard")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "dashboard"
 LOG_FILE = BASE_DIR / "dashboard_debug.log"
-DASHBOARD_BUILD = "2026.08.21-long-session-1"
+DASHBOARD_BUILD = "2026.08.21-safety-wecom-1"
 MONITOR_BROWSER_CHANNEL = "msedge"
 INTERVAL_CYCLE_SECONDS = (60, 120, 180, 240, 300)
 ERROR_COOLDOWN_SECONDS = (15 * 60, 30 * 60, 60 * 60)
@@ -661,6 +661,10 @@ class MonitorController:
             self.consecutive_scan_errors = 0
             self.cooldown_seconds = 0
         self._log("error", reason)
+        try:
+            self.notifications.notify_safety(reason, self.config.keyword)
+        except Exception:
+            LOGGER.exception("企业微信安全暂停通知排队失败")
         notifier.notify("闲鱼监控已暂停", reason)
 
     def _record_scan_success(self) -> None:

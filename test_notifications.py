@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -10,6 +11,7 @@ from notifications import (
     NotificationConfigStore,
     NotificationManager,
     WebhookDeliveryError,
+    SafetyNotification,
     build_dingtalk_url,
     build_webhook_payload,
     build_xianyu_app_entry_url,
@@ -215,6 +217,25 @@ class NotificationTests(unittest.TestCase):
         self.assertIn("在闲鱼 App 中打开", payload["markdown"]["content"])
         self.assertIn("网页备用", payload["markdown"]["content"])
 
+    def test_wecom_safety_payload_contains_reason_and_redacts_credentials(self) -> None:
+        payload = build_webhook_payload(
+            "wecom",
+            SafetyNotification(
+                reason="检测到验证码 key=private-key",
+                keyword="mardi短袖",
+                occurred_at="2026-08-21T10:00:00+00:00",
+            ),
+        )
+
+        self.assertEqual(payload["msgtype"], "markdown")
+        content = payload["markdown"]["content"]
+        self.assertIn("安全暂停", content)
+        self.assertIn("检测到验证码", content)
+        self.assertIn("mardi短袖", content)
+        self.assertIn("发生时间", content)
+        self.assertIn("redacted", content)
+        self.assertNotIn("private-key", content)
+
     def test_listing_image_only_accepts_alibaba_https_cdn(self) -> None:
         self.assertEqual(
             normalize_listing_image_url("//img.alicdn.com/item.jpg"),
@@ -313,6 +334,41 @@ class NotificationTests(unittest.TestCase):
             self.assertTrue(transport.called.wait(timeout=1))
             self.assertEqual(len(transport.calls), 1)
             self.assertIn("新发布短袖", transport.calls[0][1]["markdown"]["content"])
+
+    def test_enabled_wecom_receives_safety_event(self) -> None:
+        transport = RecordingTransport()
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            manager = NotificationManager(
+                Path(temporary_dir) / "notifications.json",
+                transport=transport,
+            )
+            manager.save(
+                {"wecom": {"enabled": True, "webhook_url": WECOM_WEBHOOK}}
+            )
+
+            manager.notify_listing(
+                ListingNotification(
+                    title="新发布短袖",
+                    price=58,
+                    keyword="mardi短袖",
+                    max_price=60,
+                    url="https://www.goofish.com/item?id=new",
+                )
+            )
+            manager.notify_safety("检测到访问受限", "mardi短袖")
+
+            self.assertTrue(transport.called.wait(timeout=1))
+            for _ in range(20):
+                if len(transport.calls) >= 2:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(transport.calls), 2)
+            safety_payloads = [
+                call[1]
+                for call in transport.calls
+                if "安全暂停" in call[1]["markdown"]["content"]
+            ]
+            self.assertEqual(len(safety_payloads), 1)
 
 
 if __name__ == "__main__":

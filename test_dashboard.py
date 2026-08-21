@@ -30,6 +30,7 @@ class FakeNotifier:
 class FakeNotificationManager:
     def __init__(self) -> None:
         self.listings = []
+        self.safety_events: list[tuple[str, str]] = []
 
     def public_snapshot(self) -> dict:
         return {
@@ -39,6 +40,9 @@ class FakeNotificationManager:
 
     def notify_listing(self, notification) -> None:
         self.listings.append(notification)
+
+    def notify_safety(self, reason: str, keyword: str) -> None:
+        self.safety_events.append((reason, keyword))
 
 
 class DashboardTests(unittest.TestCase):
@@ -289,20 +293,29 @@ class DashboardTests(unittest.TestCase):
     def test_safety_issue_pauses_monitor_and_keeps_browser_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
-            controller = MonitorController(root / "state.json", root / "profile")
+            notifications = FakeNotificationManager()
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=notifications,
+            )
             notifier = FakeNotifier()
             controller.running = True
 
-            controller._pause_for_safety("检测到访问受限", notifier)
+            controller._pause_for_safety("检测到验证码", notifier)
 
             self.assertFalse(controller._stop_event.is_set())
             self.assertFalse(controller.running)
             self.assertEqual(controller.status, "safety_stopped")
             self.assertEqual(controller.status_text, "等待人工验证")
-            self.assertEqual(controller.error, "检测到访问受限")
+            self.assertEqual(controller.error, "检测到验证码")
             self.assertEqual(controller.safety_pause_count, 1)
             self.assertEqual(controller.cooldown_seconds, 0)
             self.assertEqual(len(notifier.messages), 1)
+            self.assertEqual(
+                notifications.safety_events,
+                [("检测到验证码", "mardi短袖")],
+            )
 
     def test_safety_pause_resumes_existing_monitor_thread(self) -> None:
         class AliveThread:

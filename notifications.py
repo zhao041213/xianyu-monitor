@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -53,6 +55,23 @@ class ListingNotification:
     max_price: float
     url: str
     image_url: str | None = None
+
+
+@dataclass(frozen=True)
+class SafetyNotification:
+    reason: str
+    keyword: str
+    occurred_at: str
+
+
+NotificationPayload = ListingNotification | SafetyNotification | None
+NotificationQueueItem = tuple[
+    int,
+    int,
+    str,
+    ChannelSettings,
+    NotificationPayload,
+]
 
 
 def iso_now() -> str:
@@ -224,6 +243,16 @@ def _escape_markdown(value: str) -> str:
     return escaped
 
 
+def _compact_diagnostic(value: str, limit: int = 800) -> str:
+    text = " ".join(str(value).split())
+    text = re.sub(
+        r"(?i)(key|access_token|sign|secret)=([^&\s]+)",
+        r"\1=[redacted]",
+        text,
+    )
+    return text[:limit] or "未提供详细信息"
+
+
 def build_xianyu_app_entry_url(listing_url: str) -> str:
     try:
         parsed = urlsplit(listing_url)
@@ -266,7 +295,7 @@ def normalize_listing_image_url(image_url: str | None) -> str | None:
 
 def build_webhook_payload(
     channel: str,
-    notification: ListingNotification | None = None,
+    notification: NotificationPayload = None,
 ) -> dict[str, Any]:
     if notification is None:
         if channel == "wecom":
@@ -283,6 +312,35 @@ def build_webhook_payload(
                     "title": "闲鱼新货雷达",
                     "text": "### 闲鱼新货雷达\n\n钉钉通知测试成功",
                 },
+            }
+        raise ValueError("不支持的通知渠道")
+
+    if isinstance(notification, SafetyNotification):
+        keyword = _escape_markdown(_compact_diagnostic(notification.keyword, 80))
+        occurred_at = _escape_markdown(_compact_diagnostic(notification.occurred_at, 80))
+        reason = _escape_markdown(_compact_diagnostic(notification.reason))
+        if channel == "wecom":
+            content = (
+                "## 闲鱼监控安全暂停\n"
+                "> 检测到验证码、访问受限或登录异常，已停止继续扫描。\n"
+                f"> 关键词：`{keyword}`\n"
+                f"> 发生时间：{occurred_at}\n"
+                f"> 异常信息：{reason}\n\n"
+                "> 请在保留的 Edge 页面中完成人工处理，然后回到面板点击“继续监控”。"
+            )
+            return {"msgtype": "markdown", "markdown": {"content": content}}
+        if channel == "dingtalk":
+            text = (
+                "### 闲鱼监控安全暂停\n\n"
+                "检测到验证码、访问受限或登录异常，已停止继续扫描。\n\n"
+                f"- 关键词：{keyword}\n"
+                f"- 发生时间：{occurred_at}\n"
+                f"- 异常信息：{reason}\n\n"
+                "请在保留的 Edge 页面中完成人工处理，然后回到面板点击“继续监控”。"
+            )
+            return {
+                "msgtype": "markdown",
+                "markdown": {"title": "闲鱼监控安全暂停", "text": text},
             }
         raise ValueError("不支持的通知渠道")
 
@@ -407,9 +465,10 @@ class NotificationManager:
         self.store = NotificationConfigStore(config_path)
         self.transport = transport
         self.result_callback = result_callback
-        self._queue: queue.Queue[tuple[str, ChannelSettings, ListingNotification]] = (
-            queue.Queue(maxsize=100)
+        self._queue: queue.PriorityQueue[NotificationQueueItem] = queue.PriorityQueue(
+            maxsize=100
         )
+        self._queue_sequence = itertools.count()
         self._status_lock = threading.RLock()
         self._delivery_status: dict[str, dict[str, str | None]] = {
             channel: {"last_result": None, "last_result_at": None, "last_error": None}
@@ -484,14 +543,55 @@ class NotificationManager:
             channel_settings = getattr(settings, channel)
             if not channel_settings.enabled or not channel_settings.webhook_url:
                 continue
-            try:
-                self._queue.put_nowait((channel, channel_settings, notification))
-            except queue.Full:
-                self._record_result(channel, False, "通知队列已满，本条消息未发送")
+            self._enqueue(
+                channel,
+                channel_settings,
+                notification,
+                priority=10,
+                full_message="通知队列已满，本条消息未发送",
+            )
+
+    def notify_safety(self, reason: str, keyword: str) -> None:
+        settings = self.store.snapshot().wecom
+        if not settings.enabled or not settings.webhook_url:
+            return
+        self._enqueue(
+            "wecom",
+            settings,
+            SafetyNotification(
+                reason=reason,
+                keyword=keyword,
+                occurred_at=iso_now(),
+            ),
+            priority=0,
+            full_message="安全暂停通知队列已满，本次消息未发送",
+        )
+
+    def _enqueue(
+        self,
+        channel: str,
+        settings: ChannelSettings,
+        notification: NotificationPayload,
+        *,
+        priority: int,
+        full_message: str,
+    ) -> None:
+        try:
+            self._queue.put_nowait(
+                (
+                    priority,
+                    next(self._queue_sequence),
+                    channel,
+                    settings,
+                    notification,
+                )
+            )
+        except queue.Full:
+            self._record_result(channel, False, full_message)
 
     def _worker(self) -> None:
         while True:
-            channel, settings, notification = self._queue.get()
+            _, _, channel, settings, notification = self._queue.get()
             try:
                 self._deliver(channel, settings, notification)
             except WebhookDeliveryError as exc:
@@ -500,7 +600,12 @@ class NotificationManager:
                 LOGGER.exception("通知发送线程异常")
                 self._record_result(channel, False, "通知发送失败")
             else:
-                self._record_result(channel, True, "商品提醒已发送")
+                message = (
+                    "安全暂停通知已发送"
+                    if isinstance(notification, SafetyNotification)
+                    else "商品提醒已发送"
+                )
+                self._record_result(channel, True, message)
             finally:
                 self._queue.task_done()
 
@@ -508,7 +613,7 @@ class NotificationManager:
         self,
         channel: str,
         settings: ChannelSettings,
-        notification: ListingNotification | None,
+        notification: NotificationPayload,
     ) -> None:
         url = settings.webhook_url
         if channel == "dingtalk":
