@@ -121,6 +121,7 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(snapshot["capabilities"]["live_interval"])
             self.assertTrue(snapshot["capabilities"]["interval_cycle"])
             self.assertTrue(snapshot["capabilities"]["live_popup"])
+            self.assertTrue(snapshot["capabilities"]["live_keyword"])
             self.assertTrue(snapshot["capabilities"]["file_logging"])
             self.assertTrue(snapshot["capabilities"]["long_session_metrics"])
             self.assertTrue(snapshot["diagnostics"]["log_file"].endswith("dashboard_debug.log"))
@@ -241,6 +242,81 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(controller.scheduled_interval_seconds, 137)
             self.assertTrue(controller._interval_changed_event.is_set())
             self.assertIsNotNone(controller.next_scan_at)
+
+    def test_running_monitor_can_switch_keyword_and_search_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+            controller.running = True
+            controller.status = "waiting"
+            controller.baseline_ready = True
+            controller.last_scan_at = "2026-08-23T10:00:00+00:00"
+            controller.scans_completed = 3
+            controller.items_last_scan = 21
+            controller.new_items_last_scan = 4
+            controller.matched_last_scan = 2
+            controller.state_store.establish_baseline("iPhone 15", {"known"})
+            previous_revision = controller._keyword_revision
+
+            changed, message = controller.search_keyword({"keyword": "iPhone 15"})
+
+            self.assertTrue(changed)
+            self.assertIn("iPhone 15", message)
+            self.assertEqual(controller.config.keyword, "iPhone 15")
+            self.assertTrue(controller.baseline_ready)
+            self.assertIsNone(controller.last_scan_at)
+            self.assertEqual(controller.scans_completed, 0)
+            self.assertEqual(controller.items_last_scan, 0)
+            self.assertEqual(controller.new_items_last_scan, 0)
+            self.assertEqual(controller.matched_last_scan, 0)
+            self.assertEqual(controller.status_text, "正在切换关键词")
+            self.assertTrue(controller._scan_now_event.is_set())
+            self.assertEqual(controller._keyword_revision, previous_revision + 1)
+
+            processed = controller._process_scan(
+                [SearchItem("old", "旧关键词商品", 20, "https://example.com/old")],
+                MonitorConfig(),
+                FakeNotifier(),
+                keyword_revision=previous_revision,
+            )
+            self.assertFalse(processed)
+            self.assertEqual(controller.scans_completed, 0)
+
+    def test_running_monitor_can_search_same_keyword_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+            controller.running = True
+
+            changed, message = controller.search_keyword({"keyword": "mardi短袖"})
+
+            self.assertFalse(changed)
+            self.assertIn("立即检索", message)
+            self.assertTrue(controller._scan_now_event.is_set())
+
+    def test_keyword_search_rejects_stopped_or_safety_paused_monitor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+
+            with self.assertRaisesRegex(ValueError, "监控未运行"):
+                controller.search_keyword({"keyword": "iPhone 15"})
+
+            controller.status = "safety_stopped"
+            with self.assertRaisesRegex(ValueError, "等待人工验证"):
+                controller.search_keyword({"keyword": "iPhone 15"})
 
     def test_interval_change_does_not_shorten_active_error_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

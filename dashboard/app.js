@@ -1,6 +1,7 @@
 const state = {
   initialized: false,
   formDirty: false,
+  keywordUpdating: false,
   intervalUpdating: false,
   popupUpdating: false,
   clientError: null,
@@ -14,6 +15,7 @@ const state = {
 const elements = {
   form: document.querySelector("#controlForm"),
   keyword: document.querySelector("#keyword"),
+  keywordSearchButton: document.querySelector("#keywordSearchButton"),
   maxPrice: document.querySelector("#maxPrice"),
   interval: document.querySelector("#interval"),
   intervalModes: [...document.querySelectorAll('input[name="interval_mode"]')],
@@ -68,7 +70,7 @@ const elements = {
 };
 
 const OUTDATED_SERVICE_MESSAGE = "控制服务仍是旧版本，请关闭当前启动窗口后重新运行 start_dashboard.cmd";
-const LIVE_CONTROL_PATHS = new Set(["/api/interval", "/api/popup"]);
+const LIVE_CONTROL_PATHS = new Set(["/api/interval", "/api/popup", "/api/keyword"]);
 
 function requestError(message, path, status = null) {
   const error = new Error(message);
@@ -111,6 +113,7 @@ function hasLiveControlCapabilities(snapshot) {
     snapshot?.capabilities?.live_interval
     && snapshot?.capabilities?.interval_cycle
     && snapshot?.capabilities?.live_popup
+    && snapshot?.capabilities?.live_keyword
     && snapshot?.capabilities?.file_logging
     && snapshot?.capabilities?.long_session_metrics,
   );
@@ -337,7 +340,14 @@ function render(snapshot) {
   elements.stopButton.disabled = !running && !verificationPaused;
   elements.stopButtonLabel.textContent = verificationPaused ? "关闭浏览器" : "暂停";
   elements.scanButton.disabled = !running || scanning;
-  elements.keyword.disabled = running || verificationPaused;
+  elements.keyword.disabled = verificationPaused
+    || state.keywordUpdating
+    || (running && !liveControlsAvailable);
+  elements.keywordSearchButton.disabled = !running
+    || verificationPaused
+    || state.keywordUpdating
+    || !liveControlsAvailable;
+  elements.keywordSearchButton.textContent = state.keywordUpdating ? "检索中" : "检索";
   elements.maxPrice.disabled = running || verificationPaused;
   elements.accessModes.forEach((input) => { input.disabled = running || verificationPaused; });
   elements.popupEnabled.disabled = state.popupUpdating || (running && !liveControlsAvailable);
@@ -473,6 +483,10 @@ async function refresh() {
 
 elements.form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (state.lastSnapshot?.running) {
+    await searchKeyword();
+    return;
+  }
   const wasPaused = state.lastSnapshot?.status === "safety_stopped";
   try {
     const snapshot = await api("/api/start", {
@@ -492,6 +506,47 @@ elements.form.addEventListener("submit", async (event) => {
   input.addEventListener("input", () => {
     state.formDirty = true;
   });
+});
+
+async function searchKeyword() {
+  const keyword = elements.keyword.value.trim();
+  if (!keyword) {
+    elements.keyword.focus();
+    showToast("请输入搜索关键词");
+    return;
+  }
+  const previousKeyword = state.lastSnapshot?.config.keyword || "";
+  state.keywordUpdating = true;
+  render(state.lastSnapshot);
+  try {
+    const response = await api("/api/keyword", {
+      method: "POST",
+      body: JSON.stringify({ keyword }),
+    });
+    state.formDirty = false;
+    state.keywordUpdating = false;
+    state.clientError = null;
+    render(response.snapshot);
+    showToast(response.changed
+      ? `已切换至“${response.snapshot.config.keyword}”并开始检索`
+      : `正在检索“${response.snapshot.config.keyword}”`);
+  } catch (error) {
+    state.keywordUpdating = false;
+    elements.keyword.value = previousKeyword;
+    state.formDirty = false;
+    render(state.lastSnapshot);
+    reportClientError("修改搜索关键词", error);
+  }
+}
+
+elements.keywordSearchButton.addEventListener("click", () => {
+  void searchKeyword();
+});
+
+elements.keyword.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || !state.lastSnapshot?.running) return;
+  event.preventDefault();
+  void searchKeyword();
 });
 
 async function saveIntervalSettings() {

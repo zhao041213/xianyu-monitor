@@ -39,7 +39,7 @@ LOGGER = logging.getLogger("xianyu-dashboard")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "dashboard"
 LOG_FILE = BASE_DIR / "dashboard_debug.log"
-DASHBOARD_BUILD = "2026.08.21-safety-wecom-1"
+DASHBOARD_BUILD = "2026.08.23-keyword-search-1"
 MONITOR_BROWSER_CHANNEL = "msedge"
 INTERVAL_CYCLE_SECONDS = (60, 120, 180, 240, 300)
 ERROR_COOLDOWN_SECONDS = (15 * 60, 30 * 60, 60 * 60)
@@ -173,6 +173,7 @@ class MonitorController:
         self._scan_now_event = threading.Event()
         self._interval_changed_event = threading.Event()
         self._interval_cycle_index = 0
+        self._keyword_revision = 0
         self.scheduled_interval_seconds: int | None = None
         self.consecutive_scan_errors = 0
         self.cooldown_seconds = 0
@@ -237,6 +238,7 @@ class MonitorController:
                 self._scan_now_event.clear()
                 self._interval_changed_event.clear()
                 self._interval_cycle_index = 0
+                self._keyword_revision = 0
                 self.scheduled_interval_seconds = None
                 self.consecutive_scan_errors = 0
                 self.cooldown_seconds = 0
@@ -298,6 +300,42 @@ class MonitorController:
             self._scan_now_event.set()
         self._log("info", "已请求立即扫描")
         return True
+
+    def search_keyword(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        with self._lock:
+            if self.status == "safety_stopped":
+                raise ValueError("等待人工验证时不能修改关键词，请先完成验证或关闭浏览器")
+            if not self.running or self._stop_event.is_set():
+                raise ValueError("监控未运行，请先启动监控")
+
+            config_payload = asdict(self.config)
+            config_payload["keyword"] = payload.get("keyword", "")
+            updated_config = MonitorConfig.from_payload(config_payload)
+            keyword_changed = updated_config.keyword != self.config.keyword
+            self.config = updated_config
+            self.next_scan_at = iso_now()
+            self._scan_now_event.set()
+
+            if keyword_changed:
+                self._keyword_revision += 1
+                self._interval_cycle_index = 0
+                self.baseline_ready = self.state_store.has_baseline(
+                    updated_config.keyword
+                )
+                self.last_scan_at = None
+                self.scans_completed = 0
+                self.items_last_scan = 0
+                self.new_items_last_scan = 0
+                self.matched_last_scan = 0
+                self.scheduled_interval_seconds = None
+                self.error = None
+                self.status_text = "正在切换关键词"
+                message = f"已切换关键词：{updated_config.keyword}，正在检索"
+            else:
+                message = f"已安排立即检索：{updated_config.keyword}"
+
+        self._log("info", message)
+        return keyword_changed, message
 
     def clear_alerts(self) -> None:
         self.state_store.clear_alerts(self.config.keyword)
@@ -392,6 +430,7 @@ class MonitorController:
                     "live_interval": True,
                     "interval_cycle": True,
                     "live_popup": True,
+                    "live_keyword": True,
                     "file_logging": True,
                     "guest_mode": True,
                     "verification_pause": True,
@@ -507,6 +546,9 @@ class MonitorController:
                     error_cooldown: int | None = None
                     self._scan_now_event.clear()
                     with self._lock:
+                        scan_config = self.config
+                        scan_keyword_revision = self._keyword_revision
+                        monitor.keyword = scan_config.keyword
                         self.scanning = True
                         self.status = "scanning"
                         self.status_text = "正在扫描新发布"
@@ -517,8 +559,18 @@ class MonitorController:
 
                     try:
                         items = await monitor.scan()
-                        self._process_scan(items, self.config, notifier)
-                        self._record_scan_success()
+                        if self._process_scan(
+                            items,
+                            scan_config,
+                            notifier,
+                            keyword_revision=scan_keyword_revision,
+                        ):
+                            self._record_scan_success()
+                        else:
+                            self._log(
+                                "info",
+                                "关键词已更新，已忽略切换前的搜索结果",
+                            )
                     except MonitoringSafetyStop as exc:
                         self._pause_for_safety(str(exc), notifier)
                         safety_paused = True
@@ -564,54 +616,64 @@ class MonitorController:
         items: list[SearchItem],
         config: MonitorConfig,
         notifier: PopupNotifier,
-    ) -> None:
-        current_ids = {item.item_id for item in items}
+        *,
+        keyword_revision: int | None = None,
+    ) -> bool:
         with self._lock:
+            if (
+                keyword_revision is not None
+                and keyword_revision != self._keyword_revision
+            ):
+                return False
+            current_ids = {item.item_id for item in items}
             self.scans_completed += 1
             self.items_last_scan = len(items)
 
-        if not self.state_store.has_baseline(config.keyword):
-            self.state_store.establish_baseline(config.keyword, current_ids)
-            with self._lock:
+            if not self.state_store.has_baseline(config.keyword):
+                self.state_store.establish_baseline(config.keyword, current_ids)
                 self.baseline_ready = True
                 self.new_items_last_scan = 0
                 self.matched_last_scan = 0
                 self.status_text = "基线已建立"
-            self._log("info", f"首次扫描记录 {len(items)} 个商品，未推送历史商品")
-            return
+                self._log(
+                    "info",
+                    f"首次扫描记录 {len(items)} 个商品，未推送历史商品",
+                )
+                return True
 
-        known_ids = self.state_store.known_ids(config.keyword)
-        new_items = [item for item in items if item.item_id not in known_ids]
-        matched_items = select_new_eligible_items(items, known_ids, config.max_price)
-        self.state_store.record_seen(config.keyword, current_ids)
+            known_ids = self.state_store.known_ids(config.keyword)
+            new_items = [item for item in items if item.item_id not in known_ids]
+            matched_items = select_new_eligible_items(items, known_ids, config.max_price)
+            self.state_store.record_seen(config.keyword, current_ids)
 
-        with self._lock:
             self.baseline_ready = True
             self.new_items_last_scan = len(new_items)
             self.matched_last_scan = len(matched_items)
 
-        self._log(
-            "info",
-            f"扫描 {len(items)} 个商品，新出现 {len(new_items)} 个，命中 {len(matched_items)} 个",
-        )
-        for item in sorted(matched_items, key=lambda candidate: candidate.price):
-            alert = item_to_alert(item, keyword=config.keyword)
-            self.state_store.record_alert(alert)
-            notifier.notify(
-                "闲鱼新商品提醒",
-                f"{format_announcement(item, config.max_price)}\n{item.url}",
+            self._log(
+                "info",
+                "扫描 "
+                f"{len(items)} 个商品，新出现 {len(new_items)} 个，命中 {len(matched_items)} 个",
             )
-            self.notifications.notify_listing(
-                ListingNotification(
-                    title=item.title,
-                    price=item.price,
-                    keyword=config.keyword,
-                    max_price=config.max_price,
-                    url=item.url,
-                    image_url=item.image_url,
+            for item in sorted(matched_items, key=lambda candidate: candidate.price):
+                alert = item_to_alert(item, keyword=config.keyword)
+                self.state_store.record_alert(alert)
+                notifier.notify(
+                    "闲鱼新商品提醒",
+                    f"{format_announcement(item, config.max_price)}\n{item.url}",
                 )
-            )
-            self._log("match", f"¥{item.price:g} {item.title}")
+                self.notifications.notify_listing(
+                    ListingNotification(
+                        title=item.title,
+                        price=item.price,
+                        keyword=config.keyword,
+                        max_price=config.max_price,
+                        url=item.url,
+                        image_url=item.image_url,
+                    )
+                )
+                self._log("match", f"¥{item.price:g} {item.title}")
+            return True
 
     def _take_next_interval_locked(self) -> int:
         if not self.config.interval_cycle_enabled:
@@ -760,6 +822,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": "监控未运行"}, HTTPStatus.CONFLICT)
                     return
                 self._send_json(self.controller.snapshot(), HTTPStatus.ACCEPTED)
+                return
+            if self.path == "/api/keyword":
+                changed, message = self.controller.search_keyword(payload)
+                self._send_json(
+                    {
+                        "changed": changed,
+                        "message": message,
+                        "snapshot": self.controller.snapshot(),
+                    },
+                    HTTPStatus.ACCEPTED,
+                )
                 return
             if self.path == "/api/alerts/clear":
                 self.controller.clear_alerts()

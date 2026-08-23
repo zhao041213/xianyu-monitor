@@ -31,10 +31,13 @@
         </div>
 
         <form id="controlForm" class="control-form">
-          <label class="field">
-            <span>搜索关键词</span>
-            <input id="keyword" name="keyword" maxlength="80" value="mardi短袖" autocomplete="off">
-          </label>
+          <div class="field keyword-field">
+            <label for="keyword">搜索关键词</label>
+            <div class="keyword-input">
+              <input id="keyword" name="keyword" maxlength="80" value="mardi短袖" autocomplete="off">
+              <button id="keywordSearchButton" class="button button-secondary keyword-search-button" type="button" title="按当前关键词立即检索">检索</button>
+            </div>
+          </div>
 
           <fieldset class="mode-field">
             <legend>访问方式</legend>
