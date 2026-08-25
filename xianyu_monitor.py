@@ -20,6 +20,9 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 LOGGER = logging.getLogger("xianyu-monitor")
 BASE_URL = "https://www.goofish.com"
+BROWSER_CHANNELS = {"edge": "msedge", "chrome": "chrome"}
+BROWSER_NAMES = {"edge": "Microsoft Edge", "chrome": "Google Chrome"}
+DEFAULT_BROWSER = "edge"
 ITEM_SELECTOR = 'a[href*="/item?id="]'
 NO_RESULTS_TEXT = "小闲鱼没有找到你想要的宝贝~"
 CAPTCHA_URL_MARKERS = ("/punish", "/captcha", "/verify")
@@ -73,6 +76,10 @@ IMAGE_PLACEHOLDER_MARKERS = ("2-tps-2-2.png", "data:image")
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def default_browser_profile_dir(browser: str) -> Path:
+    return Path(f".{browser}-browser-data")
 
 
 def select_product_image_url(candidates: list[str | None]) -> str | None:
@@ -611,13 +618,18 @@ async def run_monitor(args: argparse.Namespace) -> None:
             "再执行 python -m playwright install chromium"
         ) from exc
 
-    profile_dir = Path(args.profile_dir).resolve()
+    profile_dir = (
+        Path(args.profile_dir).resolve()
+        if args.profile_dir
+        else default_browser_profile_dir(args.browser).resolve()
+    )
     state_store = StateStore(Path(args.state_file).resolve())
     popup_notifier = PopupNotifier(enabled=not args.no_popup)
 
     async with async_playwright() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),
+            channel=BROWSER_CHANNELS[args.browser],
             headless=args.headless,
             locale="zh-CN",
             viewport={"width": 1440, "height": 900},
@@ -695,7 +707,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keyword", default="mardi短袖", help="闲鱼搜索关键词")
     parser.add_argument("--max-price", type=float, default=60, help="只推送严格低于此价格的商品")
     parser.add_argument("--interval", type=float, default=60, help="两轮扫描的最短间隔，默认 60 秒")
-    parser.add_argument("--profile-dir", default=".browser-data", help="保存登录态的 Playwright 用户目录")
+    parser.add_argument(
+        "--browser",
+        choices=tuple(BROWSER_CHANNELS),
+        default=DEFAULT_BROWSER,
+        help="监控浏览器：edge 或 chrome，默认 edge",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default="",
+        help="保存登录态的用户目录；留空时按浏览器使用独立目录",
+    )
     parser.add_argument("--state-file", default="monitor_state.json", help="保存已播报商品 ID 的文件")
     parser.add_argument("--login-timeout", type=int, default=600, help="首次登录最多等待秒数")
     parser.add_argument("--headless", action="store_true", help="无界面运行；首次运行不适合用此选项登录")

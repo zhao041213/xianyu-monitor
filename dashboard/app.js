@@ -16,6 +16,7 @@ const elements = {
   form: document.querySelector("#controlForm"),
   keyword: document.querySelector("#keyword"),
   keywordSearchButton: document.querySelector("#keywordSearchButton"),
+  browserModes: [...document.querySelectorAll('input[name="browser"]')],
   maxPrice: document.querySelector("#maxPrice"),
   interval: document.querySelector("#interval"),
   intervalModes: [...document.querySelectorAll('input[name="interval_mode"]')],
@@ -114,6 +115,7 @@ function hasLiveControlCapabilities(snapshot) {
     && snapshot?.capabilities?.interval_cycle
     && snapshot?.capabilities?.live_popup
     && snapshot?.capabilities?.live_keyword
+    && snapshot?.capabilities?.browser_selection
     && snapshot?.capabilities?.file_logging
     && snapshot?.capabilities?.long_session_metrics,
   );
@@ -169,6 +171,7 @@ function configFromForm() {
     interval_cycle_enabled: elements.intervalModes.some((input) => input.checked && input.value === "cycle"),
     popup_enabled: elements.popupEnabled.checked,
     access_mode: elements.accessModes.find((input) => input.checked)?.value || "login",
+    browser: elements.browserModes.find((input) => input.checked)?.value || "edge",
   };
 }
 
@@ -350,6 +353,9 @@ function render(snapshot) {
   elements.keywordSearchButton.textContent = state.keywordUpdating ? "检索中" : "检索";
   elements.maxPrice.disabled = running || verificationPaused;
   elements.accessModes.forEach((input) => { input.disabled = running || verificationPaused; });
+  elements.browserModes.forEach((input) => {
+    input.disabled = running || verificationPaused || !snapshot?.capabilities?.browser_selection;
+  });
   elements.popupEnabled.disabled = state.popupUpdating || (running && !liveControlsAvailable);
 
   if (!state.initialized || !state.formDirty) {
@@ -360,6 +366,8 @@ function render(snapshot) {
     elements.intervalModes.forEach((input) => { input.checked = input.value === intervalMode; });
     const accessMode = snapshot.config.access_mode || "login";
     elements.accessModes.forEach((input) => { input.checked = input.value === accessMode; });
+    const browser = snapshot.config.browser || "edge";
+    elements.browserModes.forEach((input) => { input.checked = input.value === browser; });
   }
   const intervalCycleEnabled = elements.intervalModes.some(
     (input) => input.checked && input.value === "cycle",
@@ -502,7 +510,7 @@ elements.form.addEventListener("submit", async (event) => {
   }
 });
 
-[elements.keyword, elements.maxPrice, elements.interval, ...elements.intervalModes, ...elements.accessModes].forEach((input) => {
+[elements.keyword, elements.maxPrice, elements.interval, ...elements.intervalModes, ...elements.accessModes, ...elements.browserModes].forEach((input) => {
   input.addEventListener("input", () => {
     state.formDirty = true;
   });

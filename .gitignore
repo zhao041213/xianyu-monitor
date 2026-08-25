@@ -1,5 +1,6 @@
 .browser-data/
 .edge-browser-data/
+.chrome-browser-data/
 .venv/
 __pycache__/
 .pytest_cache/

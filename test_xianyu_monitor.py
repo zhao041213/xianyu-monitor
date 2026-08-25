@@ -4,10 +4,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from xianyu_monitor import (
+    BROWSER_CHANNELS,
+    DEFAULT_BROWSER,
     PopupNotifier,
     SearchItem,
     StateStore,
+    build_parser,
     detect_blocking_issue,
+    default_browser_profile_dir,
     extract_item_id,
     extract_published_label,
     extract_query_terms,
@@ -21,6 +25,18 @@ from xianyu_monitor import (
 
 
 class XianyuParsingTests(unittest.TestCase):
+    def test_browser_options_use_supported_channels_and_isolated_defaults(self) -> None:
+        parser = build_parser()
+        default_args = parser.parse_args([])
+        chrome_args = parser.parse_args(["--browser", "chrome"])
+
+        self.assertEqual(BROWSER_CHANNELS, {"edge": "msedge", "chrome": "chrome"})
+        self.assertEqual(default_args.browser, DEFAULT_BROWSER)
+        self.assertEqual(default_args.profile_dir, "")
+        self.assertEqual(chrome_args.browser, "chrome")
+        self.assertEqual(default_browser_profile_dir("edge"), Path(".edge-browser-data"))
+        self.assertEqual(default_browser_profile_dir("chrome"), Path(".chrome-browser-data"))
+
     def test_product_image_skips_placeholder_and_normalizes_cdn_url(self) -> None:
         self.assertEqual(
             select_product_image_url(

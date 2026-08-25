@@ -326,7 +326,7 @@ def build_webhook_payload(
                 f"> 关键词：`{keyword}`\n"
                 f"> 发生时间：{occurred_at}\n"
                 f"> 异常信息：{reason}\n\n"
-                "> 请在保留的 Edge 页面中完成人工处理，然后回到面板点击“继续监控”。"
+                "> 请在保留的监控浏览器页面中完成人工处理，然后回到面板点击“继续监控”。"
             )
             return {"msgtype": "markdown", "markdown": {"content": content}}
         if channel == "dingtalk":
@@ -336,7 +336,7 @@ def build_webhook_payload(
                 f"- 关键词：{keyword}\n"
                 f"- 发生时间：{occurred_at}\n"
                 f"- 异常信息：{reason}\n\n"
-                "请在保留的 Edge 页面中完成人工处理，然后回到面板点击“继续监控”。"
+                "请在保留的监控浏览器页面中完成人工处理，然后回到面板点击“继续监控”。"
             )
             return {
                 "msgtype": "markdown",

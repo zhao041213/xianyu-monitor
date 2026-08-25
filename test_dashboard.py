@@ -3,7 +3,10 @@ import unittest
 from pathlib import Path
 
 from dashboard import (
+    BROWSER_CHANNELS,
+    BROWSER_NAMES,
     DASHBOARD_BUILD,
+    DEFAULT_BROWSER,
     ERROR_COOLDOWN_SECONDS,
     INTERVAL_CYCLE_SECONDS,
     MonitorConfig,
@@ -53,6 +56,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(config.interval, 60)
         self.assertTrue(config.interval_cycle_enabled)
         self.assertEqual(config.access_mode, "login")
+        self.assertEqual(config.browser, DEFAULT_BROWSER)
 
     def test_config_rejects_too_frequent_scanning(self) -> None:
         with self.assertRaises(ValueError):
@@ -66,6 +70,7 @@ class DashboardTests(unittest.TestCase):
                 "interval": 120,
                 "interval_cycle_enabled": False,
                 "access_mode": "guest",
+                "browser": "chrome",
             }
         )
         self.assertEqual(config.keyword, "iPhone 15")
@@ -73,10 +78,20 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(config.interval, 120)
         self.assertFalse(config.interval_cycle_enabled)
         self.assertEqual(config.access_mode, "guest")
+        self.assertEqual(config.browser, "chrome")
 
     def test_config_rejects_unknown_access_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "访问方式"):
             MonitorConfig.from_payload({"access_mode": "stealth"})
+
+    def test_config_rejects_unknown_browser(self) -> None:
+        with self.assertRaisesRegex(ValueError, "监控浏览器"):
+            MonitorConfig.from_payload({"browser": "firefox"})
+
+    def test_browser_channels_and_names_are_available(self) -> None:
+        self.assertEqual(BROWSER_CHANNELS, {"edge": "msedge", "chrome": "chrome"})
+        self.assertEqual(BROWSER_NAMES["edge"], "Microsoft Edge")
+        self.assertEqual(BROWSER_NAMES["chrome"], "Google Chrome")
 
     def test_refresh_interval_accepts_custom_seconds(self) -> None:
         config = MonitorConfig.from_payload(
@@ -96,6 +111,12 @@ class DashboardTests(unittest.TestCase):
                 root / "state.json",
                 root / "profile",
                 notifications=FakeNotificationManager(),
+            )
+
+            self.assertEqual(controller.profile_dirs["edge"], (root / "profile").resolve())
+            self.assertEqual(
+                controller.profile_dirs["chrome"],
+                (root / ".chrome-browser-data").resolve(),
             )
 
             with controller._lock:
@@ -163,6 +184,10 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(
             monitor_error_message(error),
             "未找到 Microsoft Edge，请先安装或修复 Microsoft Edge",
+        )
+        self.assertEqual(
+            monitor_error_message(error, browser="chrome"),
+            "未找到 Google Chrome，请先安装或修复 Google Chrome",
         )
 
     def test_closed_monitor_browser_is_fatal_during_scan(self) -> None:
@@ -417,6 +442,26 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(controller.status, "resuming")
             self.assertTrue(controller._resume_event.is_set())
             self.assertFalse(controller._stop_event.is_set())
+
+    def test_safety_pause_cannot_resume_with_a_different_browser(self) -> None:
+        class AliveThread:
+            @staticmethod
+            def is_alive() -> bool:
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            controller = MonitorController(
+                root / "state.json",
+                root / "profile",
+                notifications=FakeNotificationManager(),
+            )
+            controller._thread = AliveThread()
+            controller.status = "safety_stopped"
+            controller.running = False
+
+            with self.assertRaisesRegex(ValueError, "浏览器"):
+                controller.start({"access_mode": "login", "browser": "chrome"})
 
     def test_safety_pause_can_be_stopped_and_close_browser(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

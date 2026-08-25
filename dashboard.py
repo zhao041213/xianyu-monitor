@@ -24,6 +24,9 @@ from notifications import (
     WebhookDeliveryError,
 )
 from xianyu_monitor import (
+    BROWSER_CHANNELS,
+    BROWSER_NAMES,
+    DEFAULT_BROWSER,
     PopupNotifier,
     MonitoringSafetyStop,
     SearchItem,
@@ -39,8 +42,7 @@ LOGGER = logging.getLogger("xianyu-dashboard")
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "dashboard"
 LOG_FILE = BASE_DIR / "dashboard_debug.log"
-DASHBOARD_BUILD = "2026.08.23-keyword-search-1"
-MONITOR_BROWSER_CHANNEL = "msedge"
+DASHBOARD_BUILD = "2026.08.23-browser-choice-1"
 INTERVAL_CYCLE_SECONDS = (60, 120, 180, 240, 300)
 ERROR_COOLDOWN_SECONDS = (15 * 60, 30 * 60, 60 * 60)
 ACCESS_MODES = {"login", "guest"}
@@ -82,7 +84,12 @@ def is_browser_closed_error(exc: Exception) -> bool:
     return "Target page, context or browser has been closed" in str(exc)
 
 
-def monitor_error_message(exc: Exception, *, during_scan: bool = False) -> str:
+def monitor_error_message(
+    exc: Exception,
+    *,
+    during_scan: bool = False,
+    browser: str = DEFAULT_BROWSER,
+) -> str:
     detail = str(exc)
     if is_browser_closed_error(exc):
         if during_scan:
@@ -92,7 +99,8 @@ def monitor_error_message(exc: Exception, *, during_scan: bool = False) -> str:
             "请关闭由本程序打开的闲鱼浏览器，再重新启动监控"
         )
     if "Executable doesn't exist" in detail:
-        return "未找到 Microsoft Edge，请先安装或修复 Microsoft Edge"
+        browser_name = BROWSER_NAMES.get(browser, browser)
+        return f"未找到 {browser_name}，请先安装或修复 {browser_name}"
     first_line = next((line.strip() for line in detail.splitlines() if line.strip()), "")
     return first_line or exc.__class__.__name__
 
@@ -113,6 +121,7 @@ class MonitorConfig:
     interval_cycle_enabled: bool = True
     popup_enabled: bool = True
     access_mode: str = "login"
+    browser: str = DEFAULT_BROWSER
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "MonitorConfig":
@@ -135,6 +144,10 @@ class MonitorConfig:
         if access_mode not in ACCESS_MODES:
             raise ValueError("访问方式必须是登录模式或游客模式")
 
+        browser = str(payload.get("browser", cls.browser)).strip().casefold()
+        if browser not in BROWSER_CHANNELS:
+            raise ValueError("监控浏览器必须是 Edge 或 Chrome")
+
         try:
             max_price = float(payload.get("max_price", cls.max_price))
             interval = int(payload.get("interval", cls.interval))
@@ -153,6 +166,7 @@ class MonitorConfig:
             interval_cycle_enabled=interval_cycle_enabled,
             popup_enabled=popup_enabled,
             access_mode=access_mode,
+            browser=browser,
         )
 
 
@@ -163,9 +177,17 @@ class MonitorController:
         profile_dir: Path,
         notification_path: Path | None = None,
         notifications: NotificationManager | None = None,
+        chrome_profile_dir: Path | None = None,
     ) -> None:
         self.state_store = StateStore(state_path)
         self.profile_dir = profile_dir.resolve()
+        self.profile_dirs = {
+            "edge": self.profile_dir,
+            "chrome": (
+                chrome_profile_dir
+                or self.profile_dir.with_name(".chrome-browser-data")
+            ).resolve(),
+        }
         self.config = MonitorConfig()
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -213,8 +235,14 @@ class MonitorController:
                     self.state_store.watch_key(self.config.keyword)
                     != self.state_store.watch_key(config.keyword)
                 )
-                if keyword_changed or config.access_mode != self.config.access_mode:
-                    raise ValueError("等待人工验证时不能修改关键词或访问方式，请先停止监控")
+                if (
+                    keyword_changed
+                    or config.access_mode != self.config.access_mode
+                    or config.browser != self.config.browser
+                ):
+                    raise ValueError(
+                        "等待人工验证时不能修改关键词、访问方式或浏览器，请先停止监控"
+                    )
                 self.config = config
                 self._interval_cycle_index = 0
                 self.scheduled_interval_seconds = None
@@ -268,6 +296,7 @@ class MonitorController:
                 self._thread.start()
         action = "恢复" if resumed else "启动"
         mode = "游客模式" if config.access_mode == "guest" else "登录模式"
+        browser_name = BROWSER_NAMES[config.browser]
         interval_mode = (
             "1 到 5 分钟循环刷新"
             if config.interval_cycle_enabled
@@ -276,7 +305,7 @@ class MonitorController:
         self._log(
             "info",
             f"监控已{action}：{config.keyword}，价格低于 {config.max_price:g} 元，"
-            f"{mode}，{interval_mode}",
+            f"{browser_name}，{mode}，{interval_mode}",
         )
         return True
 
@@ -431,6 +460,7 @@ class MonitorController:
                     "interval_cycle": True,
                     "live_popup": True,
                     "live_keyword": True,
+                    "browser_selection": True,
                     "file_logging": True,
                     "guest_mode": True,
                     "verification_pause": True,
@@ -470,7 +500,7 @@ class MonitorController:
             asyncio.run(self._monitor_loop(self.config))
         except Exception as exc:
             LOGGER.exception("监控线程异常退出")
-            message = monitor_error_message(exc)
+            message = monitor_error_message(exc, browser=self.config.browser)
             with self._lock:
                 self.error = f"{message}。详细信息见 {LOG_FILE.name}"
                 self.status = "error"
@@ -500,9 +530,11 @@ class MonitorController:
             notifier.set_enabled(self.config.popup_enabled)
         async with async_playwright() as playwright:
             browser = None
+            browser_channel = BROWSER_CHANNELS[config.browser]
+            browser_name = BROWSER_NAMES[config.browser]
             if config.access_mode == "guest":
                 browser = await playwright.chromium.launch(
-                    channel=MONITOR_BROWSER_CHANNEL,
+                    channel=browser_channel,
                     headless=False,
                 )
                 context = await browser.new_context(
@@ -511,8 +543,8 @@ class MonitorController:
                 )
             else:
                 context = await playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(self.profile_dir),
-                    channel=MONITOR_BROWSER_CHANNEL,
+                    user_data_dir=str(self.profile_dirs[config.browser]),
+                    channel=browser_channel,
                     headless=False,
                     locale="zh-CN",
                     viewport={"width": 1280, "height": 780},
@@ -526,9 +558,9 @@ class MonitorController:
                 page.set_default_timeout(15000)
                 page.on("request", self._count_page_request)
                 session_mode = (
-                    "Edge 长期会话已建立：单页面运行，保留 Cookie 和缓存"
+                    f"{browser_name} 长期会话已建立：单页面运行，保留 Cookie 和缓存"
                     if config.access_mode == "login"
-                    else "Edge 游客会话已建立：单页面运行"
+                    else f"{browser_name} 游客会话已建立：单页面运行"
                 )
                 self._log("info", session_mode)
                 monitor = XianyuMonitor(
@@ -739,7 +771,11 @@ class MonitorController:
 
     def _handle_scan_error(self, exc: Exception) -> int | None:
         browser_closed = is_browser_closed_error(exc)
-        message = monitor_error_message(exc, during_scan=True)
+        message = monitor_error_message(
+            exc,
+            during_scan=True,
+            browser=self.config.browser,
+        )
         with self._lock:
             self.status = "error"
             if browser_closed:
@@ -949,6 +985,7 @@ def main() -> int:
         state_path=BASE_DIR / "monitor_state.json",
         profile_dir=BASE_DIR / ".edge-browser-data",
         notification_path=BASE_DIR / "notification_config.json",
+        chrome_profile_dir=BASE_DIR / ".chrome-browser-data",
     )
     DashboardHandler.controller = controller
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
